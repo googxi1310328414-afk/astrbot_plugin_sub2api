@@ -1,0 +1,13 @@
+# 运行时状态与凭据,绝不入库
+state.json
+pending_recalls.json
+recovery_status.json
+status/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 本地环境
+.env
+.venv/

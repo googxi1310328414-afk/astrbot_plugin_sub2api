@@ -1,0 +1,4 @@
+# Local simulation versions; production AstrBot supplies aiohttp.
+aiohttp==3.13.3
+paramiko==5.0.0
+tzdata==2026.1

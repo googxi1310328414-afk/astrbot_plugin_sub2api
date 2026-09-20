@@ -1,0 +1,42 @@
+{
+  "base_url": {
+    "description": "sub2api API 地址(插件进程可达,含 /api/v1 前缀;见 README 网络拓扑示例)",
+    "type": "string",
+    "default": "http://127.0.0.1:8080/api/v1"
+  },
+  "admin_email": {
+    "description": "sub2api 专用管理员邮箱，必须自行配置",
+    "type": "string",
+    "default": ""
+  },
+  "admin_password": {
+    "description": "sub2api 专用管理员密码，必须自行配置，勿在群聊发送",
+    "type": "string",
+    "default": ""
+  },
+  "robbery_cooldown": {
+    "description": "打劫冷却秒数，必须为非负整数",
+    "type": "int",
+    "default": 600
+  },
+  "allow_bind_admin": {
+    "description": "是否允许绑定 sub2api 管理员账号（默认禁止）",
+    "type": "bool",
+    "default": false
+  },
+  "quota_recall_seconds": {
+    "description": "签到额度明细自动撤回秒数（1 至 120），普通成功提示保留",
+    "type": "int",
+    "default": 5
+  },
+  "recovery_enabled": {
+    "description": "后台自动核账：按确认的账务证据恢复；未知请求不会盲目重发",
+    "type": "bool",
+    "default": true
+  },
+  "recovery_interval_seconds": {
+    "description": "自动核账初始间隔秒数（10 至 900）；连续失败会退避，最长 15 分钟",
+    "type": "int",
+    "default": 30
+  }
+}
