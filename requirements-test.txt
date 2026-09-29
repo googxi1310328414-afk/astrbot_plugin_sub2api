@@ -1,4 +1,5 @@
-# Local simulation versions; production AstrBot supplies aiohttp.
+# Local simulation versions; production AstrBot supplies aiohttp and Pillow.
 aiohttp==3.13.3
 paramiko==5.0.0
+Pillow==12.3.0
 tzdata==2026.1
