@@ -108,7 +108,7 @@ docker restart astrbot                                              # 4. 重启
 - 结果未知的异常(`OutcomeUnknown`)只能查询证据,不能重发;这是账务安全的根基。
 - 面向用户的固定提示用 `UserError` 抛出,统一回复;不要把内部异常文本直接给用户。
 - 新增配置项要同步 `_conf_schema.json` 与 `main.py` 顶部 `DEFAULT_CONFIG`。
-- 改动后跑 `python -m unittest discover -s tests -v`,134 个用例全绿再谈部署。
+- 改动后跑 `python -m unittest discover -s tests -v`,144 个用例全绿再谈部署。
 
 ## 测试
 

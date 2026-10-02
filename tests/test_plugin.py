@@ -214,7 +214,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         event = Event(text="/unknown")
         event.extras["activated_handlers"] = [object()]
         text = await self.invoke("slash_command_fallback", event)
-        self.assertIn("未识别的插件指令", text)
+        self.assertIn("未知指令", text)
         self.assertEqual(self.client.operations, [])
         self.assertEqual(self.client.reads, [])
         self.assertEqual(self.client.searches, [])
@@ -351,8 +351,10 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.recall.messages), 1)
         sent_event, quota_text = self.recall.messages[0]
         self.assertIs(sent_event, event)
-        self.assertIn("0.300", quota_text)
-        self.assertIn("2.300", quota_text)
+        self.assertIn("奖励 0.300", quota_text)
+        self.assertIn("总额度 2.300", quota_text)
+        self.assertIn("秒后自动撤回", quota_text)
+        self.assertNotIn("\n", quota_text)
         self.assertEqual(len(self.client.operations), 1)
         self.assertEqual(self.client.users[1]["balance"], Decimal("2.300"))
 
@@ -489,9 +491,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             result = await self.invoke("rob", Event(targets=("99999", "10002")))
             again = await self.invoke("rob", Event(targets=("10002",)))
         self.assertIn("打劫成功", result)
-        self.assertIn("本次", result)
-        self.assertIn("0.300", result)
-        self.assertIn("user2@example.test", result)
+        self.assertIn("从 user2@example.test 抢到 0.300", result)
         self.assertNotIn("2.300", result)
         self.assertNotIn("1.700", result)
         self.assertEqual(self.recall.messages, [])
@@ -504,8 +504,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_robbery_compensates_exactly_half(self):
         with patch.object(plugin.random, "random", return_value=0.1):
             result = await self.invoke("rob", Event(targets=("10002",)))
-        self.assertIn("赔偿了 0.500", result)
-        self.assertIn("user2@example.test", result)
+        self.assertIn("向 user2@example.test 赔偿了 0.500", result)
         self.assertNotIn("1.500", result)
         self.assertNotIn("2.500", result)
         self.assertEqual(self.recall.messages, [])
@@ -514,11 +513,11 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_negative_robbery_balances_are_rejected_without_randomness_or_mutation(self):
         cases = (
-            ("-1.000", "2.000", "你的账号余额为负", [1]),
-            ("-0.0001", "2.000", "你的账号余额为负", [1]),
-            ("2.000", "-1.000", "对方账号余额为负", [1, 2]),
-            ("2.000", "-0.0001", "对方账号余额为负", [1, 2]),
-            ("-0.0001", "-2.000", "你的账号余额为负", [1]),
+            ("-1.000", "2.000", "你的余额为负", [1]),
+            ("-0.0001", "2.000", "你的余额为负", [1]),
+            ("2.000", "-1.000", "对方余额为负", [1, 2]),
+            ("2.000", "-0.0001", "对方余额为负", [1, 2]),
+            ("-0.0001", "-2.000", "你的余额为负", [1]),
         )
         before = copy.deepcopy(self.bot.state)
         for own, target, expected, reads in cases:
@@ -534,7 +533,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("本次未扣款", result)
                 self.assertIn("不计入冷却", result)
                 if expected.startswith("你的"):
-                    self.assertNotIn("对方账号余额为负", result)
+                    self.assertNotIn("对方余额为负", result)
                 chance.assert_not_called()
                 amount.assert_not_called()
                 save.assert_not_called()
@@ -557,7 +556,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             self.bot, "_rand_amount",
         ) as amount, patch.object(plugin, "save_state", wraps=plugin.save_state) as save:
             result = await self.invoke("checkin")
-        self.assertIn("你的账号余额为负", result)
+        self.assertIn("你的余额为负", result)
         self.assertIn("本次未扣款", result)
         self.assertIn("不计入签到记录", result)
         self.assertNotIn("待核对", result)
@@ -581,7 +580,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             self.bot, "_rand_amount",
         ) as amount, patch.object(plugin, "save_state", wraps=plugin.save_state) as save:
             result = await self.invoke("rob", Event(targets=("10002",)))
-        self.assertIn("对方账号余额为负", result)
+        self.assertIn("对方余额为负", result)
         self.assertIn("本次未扣款", result)
         self.assertIn("不计入冷却", result)
         self.assertNotIn("待核对", result)
@@ -605,7 +604,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                     self.bot, "_rand_amount",
                 ) as amount, patch.object(plugin, "save_state", wraps=plugin.save_state) as save:
                     result = await self.invoke("rob", Event(targets=("10002",)))
-                self.assertIn("不足以承担打劫失败时的 0.500 赔款", result)
+                self.assertIn("不足以承担 0.500 赔款", result)
                 self.assertIn("本次未扣款", result)
                 self.assertIn("不计入冷却", result)
                 chance.assert_not_called()
@@ -659,7 +658,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.client.users[1]["balance"] = Decimal("0.4999")
         with patch.object(plugin.random, "random") as chance, patch.object(plugin, "save_state", wraps=plugin.save_state) as save:
             result = await self.invoke("rob", Event(targets=("10002",)))
-        self.assertIn("不足以承担打劫失败时的 0.500 赔款", result)
+        self.assertIn("不足以承担 0.500 赔款", result)
         self.assertIn("本次未扣款", result)
         self.assertIn("不计入冷却", result)
         chance.assert_not_called()
@@ -678,8 +677,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             self.bot.state["robbery_ts"].clear()
             result = await self.invoke("rob", Event(targets=("10002",)))
         self.assertIn("打劫成功", result)
-        self.assertIn("本次获得 0.000", result)
-        self.assertIn("user2@example.test", result)
+        self.assertIn("对方无可转移余额，本次获得 0.000", result)
         self.assertNotIn("0.0009", result)
         self.assertNotIn("2.001", result)
         self.assertEqual(self.recall.messages, [])
@@ -817,13 +815,16 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             public.append(result)
         self.assertEqual(len(public), 1)
         self.assertTrue(event.stopped)
-        self.assertIn("user1@example.test", public[0])
+        self.assertIn("已绑定 user1@example.test", public[0])
+        self.assertIn("状态正常", public[0])
         self.assertEqual(len(self.recall.messages), 1)
         sent_event, quota_text = self.recall.messages[0]
         self.assertIs(sent_event, event)
         for amount in ("123.456", "7.890", "987.654"):
             self.assertNotIn(amount, public[0])
-        self.assertIn("123.456", quota_text)
+        self.assertIn("当前余额：123.456", quota_text)
+        self.assertIn("秒后自动撤回", quota_text)
+        self.assertNotIn("\n", quota_text)
         for hidden in ("7.890", "987.654", "冻结", "累计"):
             self.assertNotIn(hidden, quota_text)
         self.assertNotRegex(public[0], r"\d+\.\d+")
@@ -845,6 +846,8 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         for amount in ("123.456", "7.890", "987.654"):
             self.assertNotIn(amount, public[0])
         self.assertIn("123.456", self.recall.messages[0][1])
+        self.assertIn("秒后自动撤回", self.recall.messages[0][1])
+        self.assertNotIn("\n", self.recall.messages[0][1])
         for hidden in ("7.890", "987.654", "冻结", "累计"):
             self.assertNotIn(hidden, self.recall.messages[0][1])
         self.assertEqual(self.client.reads, [1])
@@ -867,6 +870,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["checkin_uid"]["1"], "2026-09-15")
         self.assertIn("10001", state["binding_requests"])
         self.assertEqual(state["robbery_ts"]["10001"], 1000)
+        self.assertEqual(state["protections"], {})  # 非金融可选键：legacy 无该键时回填空表
         plugin.save_state(state, str(self.path))
         self.assertEqual(plugin.load_state(str(self.path)), state)
         self.bot = self.reload()
@@ -878,6 +882,151 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.state["checkin_uid"]["1"], "2026-09-15")
         self.assertEqual(self.bot.state["robbery_ts"]["10001"], 1000)
         self.assertEqual(self.client.operations, [])
+
+    async def test_unbind_removes_binding_keeps_checkin_uid_and_robbery_ts(self):
+        self.bot.state["robbery_ts"]["10001"] = 1234
+        self.assertIn("签到成功", await self.invoke("checkin"))
+        result = await self.invoke("unbind", Event(text="/解绑"))
+        self.assertIn("已解绑 user1@example.test", result)
+        self.assertNotIn("10001", self.bot.state["bindings"])
+        saved = plugin.load_state(str(self.path))
+        self.assertNotIn("10001", saved["bindings"])
+        self.assertEqual(saved["checkin"].get("10001"), saved["checkin_uid"]["1"])
+        self.assertEqual(saved["robbery_ts"].get("10001"), 1234)
+        self.assertEqual(len(self.client.operations), 1)  # 仅签到那一笔；解绑零 API 操作
+        self.assertEqual(self.client.searches, [])
+
+    async def test_unbind_blocked_while_pending_transaction_exists(self):
+        self.client.plans = ["unknown_after"]
+        self.assertIn("待核对", await self.invoke("checkin"))
+        result = await self.invoke("unbind", Event(text="/解绑"))
+        self.assertIn("待核对", result)
+        self.assertIn("流水", result)
+        self.assertIn("10001", self.bot.state["bindings"])
+        self.assertEqual(len(self.client.operations), 1)
+
+    async def test_unbind_requires_binding_and_ignores_repeat(self):
+        self.bot.state["bindings"].pop("10001")
+        self.assertIn("尚未完成账号绑定", await self.invoke("unbind", Event(text="/解绑")))
+        self.assertIn("已解绑", await self.invoke("unbind", Event(qq="10002", text="/解绑")))
+        again = await self.invoke("unbind", Event(qq="10002", text="/解绑"))
+        self.assertIn("尚未完成账号绑定", again)
+        self.assertEqual(set(self.bot.state["bindings"]), {"10003"})
+        self.assertEqual(self.client.operations, [])
+        self.assertEqual(self.client.searches, [])
+
+    async def test_unbind_then_rebind_cannot_farm_checkin(self):
+        self.bot.state["bindings"].pop("10003")
+        self.assertIn("签到成功", await self.invoke("checkin"))
+        self.assertIn("已解绑", await self.invoke("unbind", Event(text="/解绑")))
+        self.assertIn("绑定成功", await self.invoke("bind", Event(text="/绑定 user1@example.test")))
+        self.assertIn("已经签过", await self.invoke("checkin"))
+        self.assertIn("已解绑", await self.invoke("unbind", Event(text="/解绑")))
+        self.assertIn("绑定成功", await self.invoke("bind", Event(text="/绑定 user3@example.test")))
+        self.assertIn("已经签过", await self.invoke("checkin"))
+        self.assertEqual(len(self.client.operations), 1)  # 重复签到不再写入
+
+    async def test_protection_toggle_requires_binding_and_persists(self):
+        self.bot.state["bindings"].pop("10001")
+        self.assertIn("尚未完成", await self.invoke("protect", Event(text="/保护")))
+        self.assertNotIn("10001", self.bot.state.get("protections", {}))
+        text = await self.invoke("protect", Event(qq="10002", text="/保护"))
+        self.assertIn("免打劫保护已开启", text)
+        self.assertIs(self.bot.state["protections"]["10002"]["enabled"], True)
+        self.assertEqual(plugin.load_state(str(self.path))["protections"]["10002"],
+                         self.bot.state["protections"]["10002"])
+        off = await self.invoke("protect", Event(qq="10002", text="/保护"))
+        self.assertIn("免打劫保护已关闭", off)
+        self.assertIs(self.bot.state["protections"]["10002"]["enabled"], False)
+        self.assertEqual(self.client.operations, [])
+        self.assertEqual(self.client.reads, [])
+        self.assertEqual(self.client.searches, [])
+
+    async def test_protected_robber_cannot_rob_without_side_effects(self):
+        self.assertIn("免打劫保护已开启", await self.invoke("protect", Event(text="/保护")))
+        before = copy.deepcopy(self.bot.state)
+        with patch.object(plugin.random, "random") as chance, patch.object(
+                self.bot, "_rand_amount") as amount, patch.object(
+                plugin, "save_state", wraps=plugin.save_state) as save:
+            result = await self.invoke("rob", Event(targets=("10002",)))
+        self.assertIn("免打劫保护", result)
+        chance.assert_not_called()
+        amount.assert_not_called()
+        save.assert_not_called()
+        self.assertEqual(self.client.reads, [])
+        self.assertEqual(self.client.operations, [])
+        self.assertEqual(self.bot.state, before)
+        self.assertEqual(self.bot.state["robbery_ts"], {})
+        self.assertEqual(self.recall.messages, [])
+        self.assertEqual(self.transactions(), [])
+
+    async def test_protected_victim_cannot_be_robbed_and_toggles_back(self):
+        self.assertIn("免打劫保护已开启",
+                      await self.invoke("protect", Event(qq="10002", text="/保护")))
+        before = copy.deepcopy(self.bot.state)
+        result = await self.invoke("rob", Event(targets=("10002",)))
+        self.assertIn("对方已开启免打劫保护", result)
+        self.assertEqual(self.bot.state, before)
+        self.assertEqual(self.client.reads, [])
+        self.assertEqual(self.client.operations, [])
+        self.assertIn("免打劫保护已关闭",
+                      await self.invoke("protect", Event(qq="10002", text="/保护")))
+        with patch.object(plugin.random, "random", return_value=0.9):
+            robbed = await self.invoke("rob", Event(targets=("10002",)))
+        self.assertIn("打劫成功", robbed)
+        self.assertEqual(len(self.client.operations), 2)
+
+    async def test_protection_check_order_keeps_existing_message_priority(self):
+        self.assertIn("免打劫保护已开启", await self.invoke("protect", Event(text="/保护")))
+        self.bot.state["bindings"].pop("10002")
+        unbound_target = await self.invoke("rob", Event(targets=("10002",)))
+        self.assertIn("对方尚未绑定", unbound_target)
+        self.assertNotIn("免打劫保护", unbound_target)
+        self.bot.state["bindings"].pop("10001")
+        unbound_sender = await self.invoke("rob", Event(targets=("10002",)))
+        self.assertIn("你尚未完成账号绑定", unbound_sender)
+        self.assertEqual(self.client.reads, [])
+
+    async def test_protection_survives_unbind_and_reload(self):
+        self.assertIn("免打劫保护已开启", await self.invoke("protect", Event(text="/保护")))
+        self.assertIn("已解绑", await self.invoke("unbind", Event(text="/解绑")))
+        self.bot = self.reload()
+        self.assertIs(self.bot.state["protections"]["10001"]["enabled"], True)
+        self.assertIn("绑定成功", await self.invoke("bind", Event(text="/绑定 user1@example.test")))
+        result = await self.invoke("rob", Event(targets=("10002",)))
+        self.assertIn("免打劫保护", result)
+        self.assertEqual(self.client.operations, [])
+        self.assertEqual(self.client.reads, [])
+
+    def test_load_state_backfills_and_validates_protections(self):
+        base = {"version": 2, "bindings": {}, "checkin": {}, "robbery_ts": {},
+                "checkin_uid": {}, "binding_requests": {}, "transactions": {}}
+        missing = copy.deepcopy(base)
+        self.path.write_text(json.dumps(missing), encoding="utf-8")
+        self.assertEqual(plugin.load_state(str(self.path))["protections"], {})
+        good = copy.deepcopy(base)
+        good["protections"] = {"10001": {"enabled": True, "updated_at": 123.5}}
+        self.path.write_text(json.dumps(good), encoding="utf-8")
+        self.assertEqual(plugin.load_state(str(self.path))["protections"], good["protections"])
+        no_stamp = copy.deepcopy(base)
+        no_stamp["protections"] = {"10001": {"enabled": False}}
+        self.path.write_text(json.dumps(no_stamp), encoding="utf-8")
+        self.assertEqual(plugin.load_state(str(self.path))["protections"]["10001"]["updated_at"], 0)
+        broken_entries = ({"enabled": 1, "updated_at": 0},
+                          {"enabled": True, "updated_at": -1},
+                          {"enabled": True, "updated_at": "x"},
+                          {"updated_at": 0})
+        for broken_entry in broken_entries:
+            sample = copy.deepcopy(base)
+            sample["protections"] = {"10001": broken_entry}
+            self.path.write_text(json.dumps(sample), encoding="utf-8")
+            with self.subTest(entry=broken_entry), self.assertRaises(plugin.StateError):
+                plugin.load_state(str(self.path))
+        sample = copy.deepcopy(base)
+        sample["protections"] = {"not-a-qq": {"enabled": True, "updated_at": 0}}
+        self.path.write_text(json.dumps(sample), encoding="utf-8")
+        with self.assertRaises(plugin.StateError):
+            plugin.load_state(str(self.path))
 
     def test_corrupt_state_fails_closed_without_overwriting(self):
         for content in ("broken json", "null", "[]", '{"bindings":{}}'):

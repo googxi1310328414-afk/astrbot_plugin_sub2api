@@ -1,4 +1,4 @@
 name: astrbot_plugin_sub2api
 desc: sub2api余额互动，自动核账恢复，/状态渠道监控卡片，AI可调用的分组成功率查询(脱敏)
-version: v1.5.3
+version: v1.6.0
 author: zcode

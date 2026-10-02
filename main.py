@@ -186,6 +186,17 @@ def load_state(path=None) -> dict:
                 raise ValueError
             if not math.isfinite(stamp) or stamp < 0:
                 raise ValueError
+        # protections 是非金融可选键：缺失只回填空表；存在时严格校验，损坏拒绝加载。
+        if "protections" not in state:
+            state["protections"] = {}
+        for qq, entry in state["protections"].items():
+            if not QQ_PATTERN.fullmatch(qq) or not isinstance(entry, dict):
+                raise ValueError
+            if type(entry.get("enabled")) is not bool:
+                raise ValueError
+            updated_at = entry.setdefault("updated_at", 0)  # 纯诊断字段，缺失回填 0。
+            if type(updated_at) not in (int, float) or not math.isfinite(updated_at) or updated_at < 0:
+                raise ValueError
         for qq, request in state["binding_requests"].items():
             if not QQ_PATTERN.fullmatch(qq) or not isinstance(request, dict):
                 raise ValueError
@@ -762,7 +773,7 @@ def render_group_cards(rows: list, generated: str) -> str:
     return path
 
 
-@register("astrbot_plugin_sub2api", "zcode", "sub2api 余额互动：自动核账恢复与额度撤回", "1.5.3")
+@register("astrbot_plugin_sub2api", "zcode", "sub2api 余额互动：自动核账恢复与额度撤回", "1.6.0")
 class Sub2ApiPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -847,6 +858,11 @@ class Sub2ApiPlugin(Star):
         elapsed = time.time() - self.state["robbery_ts"].get(qq, 0)
         return max(0, math.ceil(self.cfg["robbery_cooldown"] - elapsed))
 
+    def _protected(self, qq) -> bool:
+        # 防御式读取：load_state 保证结构，但测试与外部脚本可能整体替换 state。
+        entry = (self.state.get("protections") or {}).get(qq)
+        return entry is not None and entry.get("enabled") is True
+
     @staticmethod
     def _rand_amount() -> Decimal:
         return Decimal(random.randint(100, 500)) / 1000
@@ -857,7 +873,7 @@ class Sub2ApiPlugin(Star):
 
     @staticmethod
     def _pending_message(tx):
-        return f"账务结果待核对（流水 {tx['id']}）；相关账号暂时暂停余额操作。系统会自动核对，无法确认时请联系管理员核账。"
+        return f"账务待核对（流水 {tx['id']}），余额操作暂缓；系统自动核对中，必要时联系管理员。"
 
     def _require_clear(self, *uids):
         pending = self._pending(uids)
@@ -983,7 +999,7 @@ class Sub2ApiPlugin(Star):
             # Normal command handlers run first. Do not duplicate their replies.
             if len(event.get_extra("activated_handlers") or []) <= 1:
                 yield event.plain_result(
-                    "未识别的插件指令。发送 /help 查看指令列表。"
+                    "未知指令，发送 /help 查看用法。"
                 )
         finally:
             event.stop_event()
@@ -1002,7 +1018,44 @@ class Sub2ApiPlugin(Star):
             raise UserError("用法：/绑定 {邮箱}，例如 /绑定 name@example.com。")
         email = normalize_email(args[0])
         await self._bind_account(qq, email, qq)
-        return "绑定成功！可以使用 /签到 /打劫 /查询。"
+        return "绑定成功！可用 /签到 /打劫 /查询。"
+
+    @filter.command("解绑", alias={"unbind"})
+    async def unbind(self, event: AstrMessageEvent):
+        """解除当前 QQ 的账号绑定：/解绑。有待核对流水时暂不可解绑。"""
+        try:
+            yield event.plain_result(await self._run(event, self._unbind))
+        finally:
+            event.stop_event()
+
+    async def _unbind(self, event, qq):
+        binding = self._binding(qq)
+        # 该 uid 存在待核对流水（含作为打劫对手方）时拒绝解绑，绑定保持不变。
+        self._require_clear(binding["uid"])
+        email = binding["email"]
+        # 保留 checkin/checkin_uid/robbery_ts/protections：防止解绑重绑刷签到，冷却与保护意愿延续。
+        self.state["bindings"].pop(qq, None)
+        self._save()
+        return f"已解绑 {email}。当日签到记录保留，重新绑定用 /绑定 邮箱。"
+
+    @filter.command("保护", alias={"免打劫"})
+    async def protect(self, event: AstrMessageEvent):
+        """切换免打劫保护：/保护。开启后不能打劫别人，也不会被打劫。"""
+        try:
+            yield event.plain_result(await self._run(event, self._protect))
+        finally:
+            event.stop_event()
+
+    async def _protect(self, event, qq):
+        self._binding(qq)
+        enabled = not self._protected(qq)
+        self.state.setdefault("protections", {})[qq] = {
+            "enabled": enabled, "updated_at": time.time(),
+        }
+        self._save()
+        if enabled:
+            return "免打劫保护已开启：不能打劫别人，也不会被打劫。再发 /保护 关闭。"
+        return "免打劫保护已关闭。"
 
     @filter.command("确认绑定")
     async def confirm_bind(self, event: AstrMessageEvent):
@@ -1023,7 +1076,7 @@ class Sub2ApiPlugin(Star):
         if not request or request["email"] != email:
             raise UserError("没有匹配的旧版绑定申请。用户可直接使用 /绑定 {邮箱} 完成绑定。")
         await self._bind_account(target, email, qq)
-        return f"已确认 QQ {target} 的账号绑定，可以使用 /签到 /打劫 /查询。"
+        return f"已确认 QQ {target} 绑定。"
 
     async def _bind_account(self, target, email, bound_by):
         user = await self.client.find_user_by_email(email)
@@ -1067,7 +1120,7 @@ class Sub2ApiPlugin(Star):
         # 与打劫相同，先读取并拦截负余额，避免签到加款请求触发上游拒绝后留下未知流水。
         before = await self._account(binding, for_write=True)
         if money(before["balance"]) < 0:
-            raise UserError("你的账号余额为负，暂时无法签到，请先补足余额。本次未扣款，不计入签到记录。")
+            raise UserError("你的余额为负，暂不能签到；本次未扣款，不计入签到记录。")
         self._require_clear(uid)
         today = datetime.now(TZ).strftime("%Y-%m-%d")
         if self.state["checkin"].get(qq) == today or self.state["checkin_uid"].get(str(uid)) == today:
@@ -1080,8 +1133,8 @@ class Sub2ApiPlugin(Star):
         self._complete_tx(tx)
         return QuotaReply(
             "签到成功！",
-            f"本次签到奖励：{amount:.3f}\n当前总额度：{money(user['balance']):.3f}\n"
-            f"此额度明细将在 {self.cfg['quota_recall_seconds']} 秒后自动撤回。",
+            f"奖励 {amount:.3f}，总额度 {money(user['balance']):.3f}"
+            f"（{self.cfg['quota_recall_seconds']} 秒后自动撤回）",
         )
 
     @filter.command("打劫", alias={"rob"})
@@ -1095,7 +1148,7 @@ class Sub2ApiPlugin(Star):
         binding = self._binding(qq)
         targets = self._at_targets(event)
         if len(targets) != 1:
-            raise UserError("用法：/打劫 @某人（请只选择一位有效 QQ 用户）。")
+            raise UserError("用法：/打劫 @某人（仅限一位）。")
         target = targets[0]
         if target == qq:
             raise UserError("不能打劫自己啦！")
@@ -1104,16 +1157,21 @@ class Sub2ApiPlugin(Star):
             raise UserError("对方尚未绑定账号，请对方先使用 /绑定 {邮箱} 完成绑定。")
         if binding["uid"] == other["uid"]:
             raise UserError("两个 QQ 指向同一账号，不能互相打劫。")
+        # 免打劫保护是纯本地开关：在任何账号读取之前拦截，不消耗冷却、不产生流水。
+        if self._protected(qq):
+            raise UserError("你已开启免打劫保护，先发 /保护 关闭后再打劫。")
+        if self._protected(target):
+            raise UserError("对方已开启免打劫保护，无法对其打劫。")
         # 预检必须先于已有 pending 锁：旧流水不能遮蔽当前账号的负余额原因。
         # `_account` 只做读取和账号状态校验；后续仍会由 `_require_clear` 阻止任何新写入。
         robber = await self._account(binding, for_write=True)
         if money(robber["balance"]) < 0:
-            raise UserError("你的账号余额为负，暂时无法打劫，请先补足余额。本次未扣款，不计入冷却。")
+            raise UserError("你的余额为负，暂不能打劫；本次未扣款，不计入冷却。")
         if money(robber["balance"]) < Decimal("0.500"):
-            raise UserError("你的账号余额不足以承担打劫失败时的 0.500 赔款，暂时无法打劫。本次未扣款，不计入冷却。")
+            raise UserError("你的余额不足以承担 0.500 赔款，暂不能打劫；本次未扣款，不计入冷却。")
         victim = await self._account(other, for_write=True)
         if money(victim["balance"]) < 0:
-            raise UserError("对方账号余额为负，暂时无法对其打劫。本次未扣款，不计入冷却。")
+            raise UserError("对方余额为负，暂不能打劫；本次未扣款，不计入冷却。")
         # 先完成负余额预检，再应用已有流水锁和冷却提示。
         # 这样旧的待核对流水不会遮蔽当前账号的负余额原因；预检只读，不会绕过流水锁。
         self._require_clear(binding["uid"], other["uid"])
@@ -1131,7 +1189,7 @@ class Sub2ApiPlugin(Star):
         self.state["robbery_ts"][qq] = time.time()
         if amount <= 0:
             self._save()
-            return f"打劫对象：{other['email']}\n打劫成功，但没有可转移的余额，本次获得 0.000。"
+            return "打劫成功！对方无可转移余额，本次获得 0.000。"
         tx = self._new_tx(
             "rob_failure" if failed else "rob_success", qq, amount,
             [{"uid": source, "operation": "subtract"}, {"uid": destination, "operation": "add"}],
@@ -1140,8 +1198,8 @@ class Sub2ApiPlugin(Star):
         await self._execute_tx(tx)
         self._complete_tx(tx)
         if failed:
-            return f"打劫对象：{other['email']}\n打劫失败！向对方赔偿了 0.500 余额。"
-        return f"打劫对象：{other['email']}\n打劫成功！本次抢到了 {amount:.3f} 余额。"
+            return f"打劫失败！向 {other['email']} 赔偿了 0.500。"
+        return f"打劫成功！从 {other['email']} 抢到 {amount:.3f}。"
 
     @filter.command("查询", alias={"balance", "余额"})
     async def query(self, event: AstrMessageEvent):
@@ -1154,14 +1212,14 @@ class Sub2ApiPlugin(Star):
     async def _query(self, event, qq):
         binding = self._binding(qq)
         user = await self._account(binding)
-        result = f"绑定账号：{binding['email']}\n账号状态：正常"
+        result = f"已绑定 {binding['email']}，状态正常"
         pending = self._pending((binding["uid"],))
         if pending:
             result += "\n" + self._pending_message(pending)
         return QuotaReply(
             result,
-            f"当前余额：{money(user['balance']):.3f}\n"
-            f"此额度明细将在 {self.cfg['quota_recall_seconds']} 秒后自动撤回。",
+            f"当前余额：{money(user['balance']):.3f}"
+            f"（{self.cfg['quota_recall_seconds']} 秒后自动撤回）",
         )
 
     @filter.command("状态", alias={"status"})
