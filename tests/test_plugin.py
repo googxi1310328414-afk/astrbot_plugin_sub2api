@@ -39,7 +39,7 @@ def load_plugin():
     modules["astrbot.api.star"].Context = object
     modules["astrbot.api.star"].register = decorator
     modules["astrbot.api.message_components"].At = At
-    source = Path(__file__).resolve().parents[1] / "astrbot_plugin_sub2api"
+    source = Path(__file__).resolve().parents[1]
     package_name = "_sub2api_command_simulation"
     package = types.ModuleType(package_name)
     package.__path__ = [str(source)]
