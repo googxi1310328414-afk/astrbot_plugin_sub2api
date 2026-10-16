@@ -39,7 +39,7 @@ def load_plugin():
     modules["astrbot.api.star"].Context = object
     modules["astrbot.api.star"].register = decorator
     modules["astrbot.api.message_components"].At = At
-    source = Path(__file__).resolve().parents[1]
+    source = Path(__file__).resolve().parents[1] / "astrbot_plugin_sub2api"
     package_name = "_sub2api_command_simulation"
     package = types.ModuleType(package_name)
     package.__path__ = [str(source)]
@@ -932,12 +932,31 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("10001", self.bot.state.get("protections", {}))
         text = await self.invoke("protect", Event(qq="10002", text="/保护"))
         self.assertIn("免打劫保护已开启", text)
+        self.assertIn("再次切换需等 24 小时", text)
         self.assertIs(self.bot.state["protections"]["10002"]["enabled"], True)
         self.assertEqual(plugin.load_state(str(self.path))["protections"]["10002"],
                          self.bot.state["protections"]["10002"])
-        off = await self.invoke("protect", Event(qq="10002", text="/保护"))
+        self.assertEqual(self.client.operations, [])
+        self.assertEqual(self.client.reads, [])
+        self.assertEqual(self.client.searches, [])
+
+    async def test_protection_switch_cooldown_blocks_and_expires(self):
+        text = await self.invoke("protect", Event(text="/保护"))
+        self.assertIn("免打劫保护已开启", text)
+        stamp = self.bot.state["protections"]["10001"]["updated_at"]
+        blocked = await self.invoke("protect", Event(text="/保护"))
+        self.assertIn("还需等待 24 小时", blocked)
+        self.assertIs(self.bot.state["protections"]["10001"]["enabled"], True)
+        self.assertEqual(self.bot.state["protections"]["10001"]["updated_at"], stamp)
+        # 冷却期内打劫拦截文案带剩余时间
+        rob = await self.invoke("rob", Event(targets=("10002",)))
+        self.assertIn("还需等待", rob)
+        # 回拨切换时间到冷却之外,过期后可正常关闭
+        self.bot.state["protections"]["10001"]["updated_at"] = (
+            plugin.time.time() - self.bot.cfg["protection_switch_cooldown"] - 1)
+        off = await self.invoke("protect", Event(text="/保护"))
         self.assertIn("免打劫保护已关闭", off)
-        self.assertIs(self.bot.state["protections"]["10002"]["enabled"], False)
+        self.assertIs(self.bot.state["protections"]["10001"]["enabled"], False)
         self.assertEqual(self.client.operations, [])
         self.assertEqual(self.client.reads, [])
         self.assertEqual(self.client.searches, [])
@@ -969,6 +988,9 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.state, before)
         self.assertEqual(self.client.reads, [])
         self.assertEqual(self.client.operations, [])
+        # 回拨切换时间越过 24 小时冷却,验证"关闭后可再被抢"的完整回路
+        self.bot.state["protections"]["10002"]["updated_at"] = (
+            plugin.time.time() - self.bot.cfg["protection_switch_cooldown"] - 1)
         self.assertIn("免打劫保护已关闭",
                       await self.invoke("protect", Event(qq="10002", text="/保护")))
         with patch.object(plugin.random, "random", return_value=0.9):

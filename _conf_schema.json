@@ -19,6 +19,11 @@
     "type": "int",
     "default": 600
   },
+  "protection_switch_cooldown": {
+    "description": "免打劫保护两次切换之间的最小间隔秒数（默认 86400 即 24 小时），必须为非负整数",
+    "type": "int",
+    "default": 86400
+  },
   "allow_bind_admin": {
     "description": "是否允许绑定 sub2api 管理员账号（默认禁止）",
     "type": "bool",

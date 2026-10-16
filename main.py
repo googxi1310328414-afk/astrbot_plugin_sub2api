@@ -42,6 +42,7 @@ DEFAULT_CONFIG = {
     "admin_email": "",
     "admin_password": "",
     "robbery_cooldown": 600,
+    "protection_switch_cooldown": 86400,
     "allow_bind_admin": False,
     "quota_recall_seconds": 5,
     "recovery_enabled": True,
@@ -773,7 +774,7 @@ def render_group_cards(rows: list, generated: str) -> str:
     return path
 
 
-@register("astrbot_plugin_sub2api", "zcode", "sub2api 余额互动：自动核账恢复与额度撤回", "1.6.0")
+@register("astrbot_plugin_sub2api", "zcode", "sub2api 余额互动：自动核账恢复与额度撤回", "1.6.1")
 class Sub2ApiPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -784,6 +785,8 @@ class Sub2ApiPlugin(Star):
                     cfg[key] = config.get(key)
         if type(cfg["robbery_cooldown"]) is not int or cfg["robbery_cooldown"] < 0:
             raise ValueError("robbery_cooldown 必须为非负整数。")
+        if type(cfg["protection_switch_cooldown"]) is not int or cfg["protection_switch_cooldown"] < 0:
+            raise ValueError("protection_switch_cooldown 必须为非负整数。")
         if type(cfg["allow_bind_admin"]) is not bool:
             raise ValueError("allow_bind_admin 必须为布尔值。")
         if type(cfg["quota_recall_seconds"]) is not int or not 1 <= cfg["quota_recall_seconds"] <= 120:
@@ -857,6 +860,31 @@ class Sub2ApiPlugin(Star):
     def _remaining_cooldown(self, qq):
         elapsed = time.time() - self.state["robbery_ts"].get(qq, 0)
         return max(0, math.ceil(self.cfg["robbery_cooldown"] - elapsed))
+
+    def _protection_switch_remaining(self, qq) -> int:
+        """距下次可切换保护状态的剩余秒数；无冷却配置或从未切换过返回 0。"""
+        cooldown = int(self.cfg["protection_switch_cooldown"])
+        if cooldown <= 0:
+            return 0
+        entry = (self.state.get("protections") or {}).get(qq)
+        if not entry:
+            return 0
+        elapsed = time.time() - entry.get("updated_at", 0)
+        return max(0, math.ceil(cooldown - elapsed))
+
+    @staticmethod
+    def _format_remaining(seconds: int) -> str:
+        if seconds <= 0:
+            return "0 秒"
+        hours, rem = divmod(seconds, 3600)
+        minutes = rem // 60
+        if hours and minutes:
+            return f"{hours} 小时 {minutes} 分钟"
+        if hours:
+            return f"{hours} 小时"
+        if minutes:
+            return f"{minutes} 分钟"
+        return f"{seconds} 秒"
 
     def _protected(self, qq) -> bool:
         # 防御式读取：load_state 保证结构，但测试与外部脚本可能整体替换 state。
@@ -1048,14 +1076,20 @@ class Sub2ApiPlugin(Star):
 
     async def _protect(self, event, qq):
         self._binding(qq)
+        remaining = self._protection_switch_remaining(qq)
+        if remaining > 0:
+            raise UserError(
+                f"保护状态切换冷却中，还需等待 {self._format_remaining(remaining)}。")
         enabled = not self._protected(qq)
         self.state.setdefault("protections", {})[qq] = {
             "enabled": enabled, "updated_at": time.time(),
         }
         self._save()
+        cooldown = int(self.cfg["protection_switch_cooldown"])
+        hint = f"再次切换需等 {self._format_remaining(cooldown)}。" if cooldown > 0 else ""
         if enabled:
-            return "免打劫保护已开启：不能打劫别人，也不会被打劫。再发 /保护 关闭。"
-        return "免打劫保护已关闭。"
+            return f"免打劫保护已开启：不能打劫别人，也不会被打劫。{hint}"
+        return f"免打劫保护已关闭。{hint}"
 
     @filter.command("确认绑定")
     async def confirm_bind(self, event: AstrMessageEvent):
@@ -1159,6 +1193,10 @@ class Sub2ApiPlugin(Star):
             raise UserError("两个 QQ 指向同一账号，不能互相打劫。")
         # 免打劫保护是纯本地开关：在任何账号读取之前拦截，不消耗冷却、不产生流水。
         if self._protected(qq):
+            remaining = self._protection_switch_remaining(qq)
+            if remaining > 0:
+                raise UserError(
+                    f"你已开启免打劫保护，还需等待 {self._format_remaining(remaining)} 才能关闭后再打劫。")
             raise UserError("你已开启免打劫保护，先发 /保护 关闭后再打劫。")
         if self._protected(target):
             raise UserError("对方已开启免打劫保护，无法对其打劫。")
