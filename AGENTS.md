@@ -85,7 +85,7 @@ docker logs --since 2m astrbot 2>&1 | grep "适配器已连接"   # NapCat 已�
 | --- | --- |
 | `/签到` 无反应 | AstrBot `wake_prefix` 缺 `/`;加回后重启 |
 | 提示"管理员登录失败" | 检查专用账号密码;首次使用需在面板完成合规确认(423) |
-| 提示"账务结果待核对(流水 …)" | 正常保护机制;等后台核账,勿手动改 state.json;长期不恢复按流水人工核对 |
+| 提示"账务待核对(流水 …)" | 正常保护机制;后台按证据核账,勿手动改 state.json;服务端始终查无记录时由 AstrBot 管理员用 `/核账 流水号 not_applied\|applied` 裁决(仅限结果未知的单步签到流水) |
 | `/状态` 报字体缺失 | 容器安装 Noto Sans CJK |
 
 ## 升级 Runbook
@@ -108,7 +108,7 @@ docker restart astrbot                                              # 4. 重启
 - 结果未知的异常(`OutcomeUnknown`)只能查询证据,不能重发;这是账务安全的根基。
 - 面向用户的固定提示用 `UserError` 抛出,统一回复;不要把内部异常文本直接给用户。
 - 新增配置项要同步 `_conf_schema.json` 与 `main.py` 顶部 `DEFAULT_CONFIG`。
-- 改动后跑 `python -m unittest discover -s tests -v`,144 个用例全绿再谈部署。
+- 改动后跑 `python -m unittest discover -s tests -v`,全部用例通过再谈部署。
 
 ## 测试
 

@@ -15,6 +15,7 @@
 | `/保护`(别名 `/免打劫`) | 免打劫开关,发送即切换;开启后既不能打劫别人也不会被打劫;两次切换至少间隔 24 小时(`protection_switch_cooldown` 可调),冷却中提示剩余时间;未绑定提示先绑定 |
 | `/查询` | 查看绑定账号余额(额度明细自动撤回,见下) |
 | `/状态` | 渲染 sub2api **公开分组**状态卡片并发图(仅公开启用分组,无集群规模数据) |
+| `/核账 流水号 not_applied\|applied` | 仅 AstrBot 管理员:对结果未知的单步签到流水人工终局。`not_applied`=确认未执行(用户可重新签到);`applied`=确认已到账(按流水日期补记签到标记,取较新不回退)。打劫流水含两步资金操作,不受理,需按文档人工核对 |
 | LLM 工具 `query_group_success_rate` | 供机器人人格在对话中自行调用,返回各启用分组近一小时成功率(白名单脱敏) |
 
 ## 安全与账务设计
@@ -65,6 +66,8 @@ git clone https://github.com/googxi1310328414-afk/astrbot_plugin_sub2api.git
 | `quota_recall_seconds` | `5` | 额度明细自动撤回秒数(1–120) |
 | `recovery_enabled` | `true` | 后台自动核账开关 |
 | `recovery_interval_seconds` | `30` | 自动核账初始间隔(10–900,失败退避最长 15 分钟) |
+| `write_timeout_seconds` | `30` | sub2api API 请求总超时秒数(5–120),连接超时固定 5 秒;写请求超时仍记为结果未知,绝不自动重发 |
+| `transaction_retention_days` | `30` | 终局流水(completed/failed/resolved)在 `state.json` 内的保留天数(1–3650);超期移入同级 `ledger_archive.json`(损坏时拒绝加载),pending 永不归档 |
 
 ### base_url 网络拓扑示例
 
@@ -96,7 +99,7 @@ git clone https://github.com/googxi1310328414-afk/astrbot_plugin_sub2api.git
 ```bash
 python -m pip install -r requirements-test.txt
 python -m unittest discover -s tests -v
-# 144 个用例:指令行为 / 账务核账恢复 / 额度撤回 / HTTP 模拟
+# 覆盖:指令行为(含 /核账)/ 账务核账恢复 / 额度撤回 / HTTP 模拟
 ```
 
 测试全部使用假事件、假账户与 `127.0.0.1` 临时端口,不访问任何真实服务。
@@ -104,7 +107,7 @@ python -m unittest discover -s tests -v
 ## 常见问题
 
 - **群里发 `/签到` 没反应?** AstrBot 的唤醒前缀必须包含 `/`(配置 `wake_prefix` 加入 `/`),否则消息在插件匹配前就被丢弃。
-- **余额操作提示"账务结果待核对"?** 出现了结果未知的请求,插件已暂停相关账号并会在后台按证据自动核账;持续未恢复时联系管理员按 `state.json` 流水与 sub2api 余额历史人工核对。
+- **余额操作提示"账务待核对"?** 出现了结果未知的请求,插件已暂停相关账号;后台会按证据自动核账,服务端始终查无记录时由管理员用 `/核账` 裁决(证据核对要求见仓库文档),或按 `state.json` 流水与 sub2api 余额历史人工核对。
 - **`/状态` 报字体缺失?** 容器需有 Noto Sans CJK;官方 `soulter/astrbot` 镜像自带。
 - **能同时跑多个实例吗?** 不能。多实例共用同一份 `state.json` 会破坏账务一致性。
 
@@ -116,7 +119,7 @@ python -m unittest discover -s tests -v
 ├── recovery.py           # 后台自动核账恢复
 ├── metadata.yaml         # 插件元数据
 ├── _conf_schema.json     # 面板配置模式
-├── tests/                # 144 个隔离测试用例
+├── tests/                # 隔离测试用例(假事件、假账户与本地端口)
 ├── AGENTS.md             # AI 代理部署/运维手册
 └── requirements-test.txt
 ```

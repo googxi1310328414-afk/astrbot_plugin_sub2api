@@ -43,5 +43,15 @@
     "description": "自动核账初始间隔秒数（10 至 900）；连续失败会退避，最长 15 分钟",
     "type": "int",
     "default": 30
+  },
+  "write_timeout_seconds": {
+    "description": "sub2api API 请求总超时秒数（5 至 120，默认 30），连接超时固定 5 秒；写请求超时仍记为结果未知，绝不自动重发",
+    "type": "int",
+    "default": 30
+  },
+  "transaction_retention_days": {
+    "description": "终局流水（completed/failed/resolved）在 state.json 内保留的天数（1 至 3650，默认 30）；超期流水移入同级 ledger_archive.json，该文件损坏时插件拒绝加载",
+    "type": "int",
+    "default": 30
   }
 }

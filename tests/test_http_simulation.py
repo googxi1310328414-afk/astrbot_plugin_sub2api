@@ -645,6 +645,21 @@ class HttpSimulationTests(unittest.IsolatedAsyncioTestCase):
                 self._assert_sanitized(raised.exception)
         self.assertEqual(self._calls("/7/balance"), [])
 
+    async def test_client_timeout_splits_connect_and_total(self):
+        default = plugin.Sub2ApiClient("http://127.0.0.1:1/api/v1", EMAIL, PASSWORD)
+        self.assertEqual((default.timeout.total, default.timeout.connect), (30, 5))
+        tuned = plugin.Sub2ApiClient("http://127.0.0.1:1/api/v1", EMAIL, PASSWORD, timeout_seconds=7)
+        self.assertEqual((tuned.timeout.total, tuned.timeout.connect), (7, 5))
+        with self.assertRaises(ValueError):
+            plugin.Sub2ApiClient("http://127.0.0.1:1/api/v1", EMAIL, PASSWORD, timeout_seconds=0)
+
+    async def test_history_lookup_records_total_for_near_limit_monitoring(self):
+        self.history = [self._ledger_record(id=1000 + i, notes=f"other:{i}") for i in range(100)]
+        self.history.append(self._ledger_record())
+        self.assertIsNotNone(await self._lookup())
+        self.assertEqual(self.client.history_totals, {7: 101})
+        self.assertEqual(self.mutations, [])
+
 
 if __name__ == "__main__":
     unittest.main()

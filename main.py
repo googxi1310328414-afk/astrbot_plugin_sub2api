@@ -35,6 +35,7 @@ except ImportError:
 
 TZ = ZoneInfo("Asia/Shanghai")
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+ARCHIVE_FILE_NAME = "ledger_archive.json"
 MILLI = Decimal("0.001")
 QQ_PATTERN = re.compile(r"[1-9][0-9]{4,11}\Z")
 DEFAULT_CONFIG = {
@@ -47,6 +48,8 @@ DEFAULT_CONFIG = {
     "quota_recall_seconds": 5,
     "recovery_enabled": True,
     "recovery_interval_seconds": 30,
+    "write_timeout_seconds": 30,
+    "transaction_retention_days": 30,
 }
 
 
@@ -124,7 +127,7 @@ def _valid_date(value):
         return False
 
 
-def load_state(path=None) -> dict:
+def load_state(path=None, retention_days=None) -> dict:
     path = path or STATE_FILE
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -235,9 +238,83 @@ def load_state(path=None) -> dict:
             if tx["status"] == "resolved" and not tx.get("resolution_note"):
                 raise ValueError
         state["version"] = 2
-        return state
     except (KeyError, TypeError, ValueError, AttributeError, InvalidOperation, UserError):
         raise StateError("状态文件结构异常，插件停止操作；请管理员检查并恢复备份。") from None
+    if retention_days is not None:
+        # 终局流水按保留期移入同级 ledger_archive.json；归档文件损坏时拒绝加载（fail-closed）。
+        _archive_stale_transactions(state, path, retention_days)
+    return state
+
+
+def _atomic_write_json(path, payload):
+    """与 save_state 相同的临时文件 + 原子替换写法，用于归档文件。"""
+    directory = os.path.dirname(os.path.abspath(path))
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=directory,
+            prefix=".sub2api-archive-", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary = stream.name
+            json.dump(payload, stream, ensure_ascii=False, indent=2, allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        if os.name != "nt":
+            directory_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    except (OSError, ValueError, TypeError):
+        raise StateError("流水归档保存失败，已暂停插件操作；请管理员检查存储。") from None
+    finally:
+        if temporary and os.path.exists(temporary):
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _archive_stale_transactions(state, path, retention_days):
+    """把超过保留期的终局流水移出 state.json，追加到同级 ledger_archive.json。
+
+    仅移动 completed/failed/resolved 流水；pending 永不归档。先写归档文件、再从内存
+    状态移除：中途崩溃后重复归档按 txid 覆盖，幂等。归档文件损坏时拒绝加载。
+    """
+    if (isinstance(retention_days, bool) or not isinstance(retention_days, (int, float))
+            or not math.isfinite(retention_days) or retention_days <= 0):
+        raise StateError("流水保留期配置异常，插件停止操作；请管理员检查配置。")
+    now = time.time()
+    stale = []
+    for txid, tx in state["transactions"].items():
+        if tx.get("status") not in ("completed", "failed", "resolved"):
+            continue
+        stamp = tx.get("completed_at")
+        if type(stamp) not in (int, float) or not math.isfinite(stamp):
+            stamp = tx.get("created_at")
+        if type(stamp) in (int, float) and math.isfinite(stamp) and stamp < now - retention_days * 86400:
+            stale.append(txid)
+    if not stale:
+        return
+    archive_path = os.path.join(os.path.dirname(os.path.abspath(path)), ARCHIVE_FILE_NAME)
+    try:
+        with open(archive_path, "r", encoding="utf-8") as stream:
+            archive = json.load(stream)
+    except FileNotFoundError:
+        archive = {"version": 1, "transactions": {}}
+    except (OSError, ValueError):
+        raise StateError("流水归档文件无法读取或已损坏，插件停止操作；请管理员检查并恢复备份。") from None
+    if (not isinstance(archive, dict) or archive.get("version") != 1
+            or not isinstance(archive.get("transactions"), dict)
+            or any(not isinstance(tx, dict) or tx.get("id") != txid
+                   for txid, tx in archive["transactions"].items())):
+        raise StateError("流水归档文件结构异常，插件停止操作；请管理员检查并恢复备份。") from None
+    for txid in stale:
+        archive["transactions"][txid] = state["transactions"][txid]
+    _atomic_write_json(archive_path, archive)
+    for txid in stale:
+        del state["transactions"][txid]
 
 
 def save_state(state: dict, path=None):
@@ -271,7 +348,7 @@ def save_state(state: dict, path=None):
 
 
 class Sub2ApiClient:
-    def __init__(self, base_url: str, email: str, password: str):
+    def __init__(self, base_url: str, email: str, password: str, timeout_seconds: int = 30):
         self.base = base_url.rstrip("/")
         parsed = urlsplit(self.base)
         if (parsed.scheme not in ("http", "https") or not parsed.hostname
@@ -279,6 +356,14 @@ class Sub2ApiClient:
             raise ValueError("sub2api API 地址格式错误。")
         self.email = email
         self.password = password
+        # 连接超时与总超时拆分：网关不可达时 5 秒内失败，慢而可达的写请求允许跑满总超时。
+        # 写请求超时仍判为结果未知，绝不自动重发（账务铁律不变）。
+        if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
+                or not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
+            raise ValueError("sub2api 请求超时配置必须为正数。")
+        self.timeout = aiohttp.ClientTimeout(total=timeout_seconds, connect=min(5, timeout_seconds))
+        # 每个 uid 最近一次账务历史总条数（只读观测，供核账监控接近 2000 条上限告警）。
+        self.history_totals = {}
         self._token = ""
         self._token_exp = 0.0
         self._login_lock = asyncio.Lock()
@@ -323,7 +408,7 @@ class Sub2ApiClient:
                     async with session.request(
                         method, f"{self.base}{path}", json=body, params=params,
                         headers={**(headers or {}), "Authorization": f"Bearer {token}"},
-                        timeout=aiohttp.ClientTimeout(total=15), allow_redirects=False,
+                        timeout=self.timeout, allow_redirects=False,
                     ) as response:
                         code = response.status
                         if code == 401 and attempt == 1:
@@ -440,6 +525,8 @@ class Sub2ApiClient:
                     or type(pages) is not int or pages != max(1, math.ceil(total / page_size))
                     or pages > 20 or len(items) != min(page_size, max(0, total - (page - 1) * page_size))):
                 raise ApiError(category="evidence_unavailable")
+            # 只读观测：记录该 uid 的账务历史规模，供恢复监控在接近 20 页上限前告警。
+            self.history_totals[uid] = max(self.history_totals.get(uid, 0), total)
             for item in items:
                 if not isinstance(item, dict):
                     raise ApiError(category="evidence_unavailable")
@@ -774,7 +861,7 @@ def render_group_cards(rows: list, generated: str) -> str:
     return path
 
 
-@register("astrbot_plugin_sub2api", "zcode", "sub2api 余额互动：自动核账恢复与额度撤回", "1.6.1")
+@register("astrbot_plugin_sub2api", "zcode", "sub2api 余额互动：自动核账恢复与额度撤回", "1.6.2")
 class Sub2ApiPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -795,10 +882,15 @@ class Sub2ApiPlugin(Star):
             raise ValueError("recovery_enabled 必须为布尔值。")
         if type(cfg["recovery_interval_seconds"]) is not int or not 10 <= cfg["recovery_interval_seconds"] <= 900:
             raise ValueError("recovery_interval_seconds 必须为 10 至 900 的整数。")
+        if type(cfg["write_timeout_seconds"]) is not int or not 5 <= cfg["write_timeout_seconds"] <= 120:
+            raise ValueError("write_timeout_seconds 必须为 5 至 120 的整数。")
+        if type(cfg["transaction_retention_days"]) is not int or not 1 <= cfg["transaction_retention_days"] <= 3650:
+            raise ValueError("transaction_retention_days 必须为 1 至 3650 的整数。")
         self.cfg = cfg
-        self.client = Sub2ApiClient(cfg["base_url"], cfg["admin_email"], cfg["admin_password"])
+        self.client = Sub2ApiClient(cfg["base_url"], cfg["admin_email"], cfg["admin_password"],
+                                    timeout_seconds=cfg["write_timeout_seconds"])
         self.state_path = STATE_FILE
-        self.state = load_state(self.state_path)
+        self.state = load_state(self.state_path, cfg["transaction_retention_days"])
         # 所有命令共用一把锁，覆盖绑定、检查、账务请求与状态落盘。
         self._lock = asyncio.Lock()
         self._state_failed = False
@@ -901,7 +993,7 @@ class Sub2ApiPlugin(Star):
 
     @staticmethod
     def _pending_message(tx):
-        return f"账务待核对（流水 {tx['id']}），余额操作暂缓；系统自动核对中，必要时联系管理员。"
+        return f"账务待核对（流水 {tx['id']}），余额操作暂缓；需管理员核对，请联系管理员。"
 
     def _require_clear(self, *uids):
         pending = self._pending(uids)
@@ -1131,6 +1223,52 @@ class Sub2ApiPlugin(Star):
         self.state["binding_requests"].pop(target, None)
         self._save()
 
+    @filter.command("核账")
+    async def audit(self, event: AstrMessageEvent):
+        """管理员人工裁决结果未知的流水：/核账 {流水号} {not_applied|applied}。"""
+        try:
+            yield event.plain_result(await self._run(event, self._audit))
+        finally:
+            event.stop_event()
+
+    async def _audit(self, event, qq):
+        # 受限人工裁决出口：只处理「结果未知且服务端查无记录」的单步签到流水。
+        # not_applied=确认未执行（docs/recovery.md 表第 1 行）；applied=确认已到账（补签到标记取 max 不回退）。
+        # 打劫流水含两步资金操作，单值裁决不足以表达分步证据，拒绝受理。
+        if not event.is_admin():
+            raise UserError("只有 AstrBot 管理员可以核账。")
+        args = self._args(event, ("核账",))
+        if (len(args) != 2 or args[1] not in ("not_applied", "applied")
+                or not re.fullmatch(r"[0-9a-f]{32}", args[0])):
+            raise UserError("用法：/核账 {流水号} {not_applied|applied}；仅限结果未知的单步签到流水。")
+        txid, verdict = args
+        tx = self.state["transactions"].get(txid)
+        if not isinstance(tx, dict) or tx.get("status") != "pending":
+            raise UserError("没有找到待核对状态的流水，请核对流水号。")
+        if tx.get("kind") != "checkin":
+            raise UserError("打劫流水包含两步资金操作，单值裁决不足以表达分步证据；请按人工恢复流程处理。")
+        outcomes = tx.get("step_outcomes")
+        if (not isinstance(outcomes, list) or not outcomes
+                or any(outcome.get("status") not in ("unknown", "inflight")
+                       for outcome in outcomes if isinstance(outcome, dict))
+                or any(not isinstance(outcome, dict) for outcome in outcomes)):
+            raise UserError("该流水没有结果未知的步骤，或为等待自动核账补齐的旧格式；请稍后再试或按人工恢复流程处理。")
+        note = (f"管理员核账：裁决为{verdict}；处理人 QQ {qq}，"
+                f"{datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')}（Asia/Shanghai），"
+                "证据核对依据 docs/recovery.md。")
+        if verdict == "applied":
+            uid = str(tx["uids"][0])
+            self.state["checkin"][tx["qq"]] = max(self.state["checkin"].get(tx["qq"], ""), tx["date"])
+            self.state["checkin_uid"][uid] = max(self.state["checkin_uid"].get(uid, ""), tx["date"])
+        tx["status"] = "resolved"
+        tx["resolution_note"] = note
+        self._save()
+        if verdict == "applied":
+            return (f"流水 {txid} 已裁决为已到账（applied）：签到标记按 {tx['date']} 补记（取较新日期），"
+                    "流水已标记 resolved。")
+        return (f"流水 {txid} 已裁决为未执行（not_applied）：流水已标记 resolved，未补签到标记；"
+                "用户可自行 /签到 补领。")
+
     @filter.command("签到", alias={"checkin"})
     async def checkin(self, event: AstrMessageEvent):
         try:
@@ -1224,10 +1362,10 @@ class Sub2ApiPlugin(Star):
             available = max(Decimal(0), money(victim["balance"])).quantize(MILLI, rounding=ROUND_DOWN)
             amount = min(self._rand_amount(), available)
             source, destination = other["uid"], binding["uid"]
-        self.state["robbery_ts"][qq] = time.time()
         if amount <= 0:
-            self._save()
+            # 对方无可转移余额：判定成功但获得 0.000，不写冷却、不产生流水（与未绑定目标不消耗判定的口径一致）。
             return "打劫成功！对方无可转移余额，本次获得 0.000。"
+        self.state["robbery_ts"][qq] = time.time()
         tx = self._new_tx(
             "rob_failure" if failed else "rob_success", qq, amount,
             [{"uid": source, "operation": "subtract"}, {"uid": destination, "operation": "add"}],

@@ -725,6 +725,70 @@ class LedgerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.client.lookups), 6)
         self.assertEqual(self.client.posts, [])
 
+    async def test_invalid_transaction_defers_instead_of_starving_quota(self):
+        invalid = self.transaction()
+        invalid["request_keys"][0] = "0" * 64
+        self.assertFalse(recovery.valid_transaction(invalid))
+        valid = [self.transaction() for _ in range(6)]
+        await self.manager.run_once(force=True)
+        # 畸形流水不改资金意图，只推后 next_check_at；本轮名额让给正常流水。
+        self.assertEqual(invalid["status"], "pending")
+        self.assertGreaterEqual(invalid["recovery"]["next_check_at"] - self.now, 30)
+        self.assertLessEqual(invalid["recovery"]["next_check_at"] - self.now, 900)
+        stored = wallet.load_state(str(self.state_path))["transactions"][invalid["id"]]
+        self.assertEqual(stored["recovery"]["next_check_at"], invalid["recovery"]["next_check_at"])
+        self.assertEqual(stored["steps"], invalid["steps"])
+        # 未到退避时间的畸形流水不再占名额；正常流水继续推进。
+        self.assertEqual(len(self.client.lookups), 4)  # 本轮 5 个名额：畸形流水 1 条 + 4 条正常
+        await self.manager.run_once()
+        self.assertEqual(invalid["recovery"]["attempts"], 1)
+        self.assertEqual(len(self.client.lookups), 6)
+        for tx in valid:
+            self.assertGreaterEqual(tx["recovery"]["next_check_at"] - self.now, 30)
+        # force 仍会复查畸形流水（每次尝试继续退避）。
+        await self.manager.run_once(force=True)
+        self.assertEqual(invalid["recovery"]["attempts"], 2)
+        self.assertEqual(self.client.posts, [])
+
+    async def test_network_lookup_does_not_hold_the_wallet_lock(self):
+        self.transaction()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def gated_lookup(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return None
+
+        with patch.object(self.client, "lookup_balance_operation", side_effect=gated_lookup):
+            task = asyncio.create_task(self.manager.run_once(force=True))
+            await asyncio.wait_for(started.wait(), timeout=2)
+            try:
+                # 核对网络 IO 挂起时，账务指令仍能立即拿到全局锁。
+                acquired = asyncio.Event()
+
+                async def probe():
+                    async with self.owner._lock:
+                        acquired.set()
+
+                probe_task = asyncio.create_task(probe())
+                await asyncio.wait_for(acquired.wait(), timeout=0.5)
+                await asyncio.wait_for(probe_task, timeout=0.5)
+            finally:
+                release.set()
+                await asyncio.wait_for(task, timeout=2)
+        self.assertEqual(self.client.lookups, [])
+
+    async def test_snapshot_reports_history_near_limit(self):
+        self.transaction()
+        self.client.history_totals = {7: 1900, 8: 1799}
+        snapshot = await self.manager.run_once(force=True)
+        self.assertEqual(snapshot["history_near_limit"], 1)
+        status = json.loads(self.manager.status_path.read_text(encoding="utf-8"))
+        self.assertEqual(status["history_near_limit"], 1)
+        del self.client.history_totals
+        self.assertEqual(self.manager._snapshot()["history_near_limit"], 0)
+
     async def test_initialize_creates_one_worker_and_terminate_cancels_wait_safely(self):
         asleep = asyncio.Queue()
 

@@ -285,7 +285,12 @@ class LedgerRecovery:
             await asyncio.sleep(self._interval())
 
     async def run_once(self, force=False):
-        """Process at most five due transactions and return the privacy-safe status."""
+        """Process at most five due transactions and return the privacy-safe status.
+
+        Network verification runs OUTSIDE the owner lock: sections that mutate
+        state.json take the lock only briefly (snapshot/persist/merge), so a slow
+        or unreachable upstream can no longer block every wallet command.
+        """
         async with self._run_lock:
             error = None
             snapshot = None
@@ -313,8 +318,9 @@ class LedgerRecovery:
                             if self.owner._state_failed:
                                 raise RuntimeError("ledger storage is unavailable")
                             tx = self.owner.state["transactions"].get(txid)
-                            if isinstance(tx, dict) and tx.get("status") == "pending":
-                                await self._recover(tx)
+                        # Snapshot taken; the lookup and any replay happen unlocked.
+                        if isinstance(tx, dict) and tx.get("status") == "pending":
+                            await self._recover(tx)
             except BaseException as exc:
                 error = exc
             try:
@@ -373,9 +379,27 @@ class LedgerRecovery:
     async def _recover(self, tx):
         if not valid_transaction(tx):
             # Do not rewrite malformed financial intent just to make it executable.
+            # Only defer the next check so five malformed entries cannot starve
+            # every other pending transaction of the per-round quota.
+            async with self.owner._lock:
+                recovery = tx.get("recovery")
+                if not isinstance(recovery, dict):
+                    recovery = {}
+                    tx["recovery"] = recovery
+                attempts = recovery.get("attempts")
+                attempts = attempts + 1 if type(attempts) is int and attempts >= 0 else 1
+                recovery["attempts"] = attempts
+                recovery["checked_at"] = time.time()
+                recovery["next_check_at"] = recovery["checked_at"] + min(
+                    900, self._interval() * 2 ** min(attempts - 1, 10))
+                self.owner._save()
             logger.warning("ledger_recovery tx=%s category=invalid_transaction", self._status_id(tx))
             return
-        recovery = self._prepare(tx)
+        async with self.owner._lock:
+            # 取快照后可能已被管理员 /核账 终局化；开始前再确认一次仍为 pending。
+            if tx.get("status") != "pending":
+                return
+            recovery = self._prepare(tx)
         if recovery.get("decision") == "refund":
             await self._refund(tx)
             return
@@ -387,58 +411,72 @@ class LedgerRecovery:
                 return
             if found is not None:
                 if index != tx["completed_steps"]:
-                    recovery.update(result="conflicting_evidence", last_error="prefix_inconsistent")
-                    self.owner._save()
+                    async with self.owner._lock:
+                        recovery.update(result="conflicting_evidence", last_error="prefix_inconsistent")
+                        self.owner._save()
                     return
                 outcome.update(status="applied", evidence=found)
                 outcome.pop("category", None)
             else:
                 outcome["status"] = "unknown"
-            self._sync(tx)
-            self.owner._save()
+            async with self.owner._lock:
+                self._sync(tx)
+                self.owner._save()
         if tx["completed_steps"] == len(tx["steps"]):
-            self._complete(tx)
+            async with self.owner._lock:
+                self._complete(tx)
             return
         outcomes = tx["step_outcomes"]
         if tx["completed_steps"] == 0 and all(o["status"] in ("not_sent", "not_applied") for o in outcomes):
-            tx["status"] = "failed"
-            recovery["result"] = "not_sent" if all(o["status"] == "not_sent" for o in outcomes) else "not_applied"
-            self._clear_old_cooldown(tx)
-            self.owner._save()
+            async with self.owner._lock:
+                tx["status"] = "failed"
+                recovery["result"] = "not_sent" if all(o["status"] == "not_sent" for o in outcomes) else "not_applied"
+                self._clear_old_cooldown(tx)
+                self.owner._save()
             return
         if tx["kind"] == "checkin" or tx["completed_steps"] != 1:
-            recovery["result"] = "waiting_evidence"
-            self.owner._save()
+            async with self.owner._lock:
+                recovery["result"] = "waiting_evidence"
+                self.owner._save()
             return
         second = outcomes[1]
         decision = recovery.get("decision")
         if decision is None:
             if second["status"] == "not_sent":
-                recovery["decision"] = "complete"
+                async with self.owner._lock:
+                    recovery["decision"] = "complete"
+                    self.owner._save()
             elif second["status"] == "not_applied":
-                recovery["decision"] = "refund"
+                async with self.owner._lock:
+                    recovery["decision"] = "refund"
+                    self.owner._save()
             else:
-                recovery["result"] = "waiting_evidence"
-                self.owner._save()
+                async with self.owner._lock:
+                    recovery["result"] = "waiting_evidence"
+                    self.owner._save()
                 return
-            self.owner._save()
         if recovery["decision"] == "refund":
             await self._refund(tx)
         elif second["status"] in ("not_sent", "not_applied"):
+            # Persisted together with the inflight intent inside _send.
             recovery["result"] = "completing"
             step = tx["steps"][1]
             await self._send(tx, second, step["uid"], step["operation"], operation_notes(tx, 1), original=True)
             if second["status"] == "applied":
-                self._complete(tx)
+                async with self.owner._lock:
+                    self._complete(tx)
             else:
-                recovery["result"] = "waiting_retry" if second["status"] == "not_applied" else "waiting_evidence"
-                self.owner._save()
+                async with self.owner._lock:
+                    recovery["result"] = "waiting_retry" if second["status"] == "not_applied" else "waiting_evidence"
+                    self.owner._save()
         else:
-            recovery["result"] = "waiting_evidence"
-            self.owner._save()
+            async with self.owner._lock:
+                recovery["result"] = "waiting_evidence"
+                self.owner._save()
 
     async def _lookup(self, tx, uid, operation, notes, created_at):
         try:
+            # Read-only network verification; runs without the owner lock.
             found = await self.owner.client.lookup_balance_operation(
                 uid, Decimal(tx["amount"]), operation, notes, created_at
             )
@@ -458,8 +496,9 @@ class LedgerRecovery:
         except asyncio.CancelledError:
             raise
         except Exception:
-            tx["recovery"].update(result="waiting_evidence", last_error="history_read_failed")
-            self.owner._save()
+            async with self.owner._lock:
+                tx["recovery"].update(result="waiting_evidence", last_error="history_read_failed")
+                self.owner._save()
             logger.warning("ledger_recovery tx=%s category=history_read_failed", tx["id"])
             return False
 
@@ -471,18 +510,26 @@ class LedgerRecovery:
         outcome.pop("code", None)
         if original:
             self._sync(tx)
+        persisted = False
         try:
-            self.owner._save()
+            async with self.owner._lock:
+                self.owner._save()
+                persisted = True
         except BaseException:
-            # No request was made. Retain this in-memory fact while storage is
-            # unavailable; the next pass must save it before attempting a write.
-            # If the process dies here, an on-disk inflight marker stays unknown.
-            outcome.clear()
-            outcome.update(previous_outcome)
-            if original:
-                tx["phase"], tx["completed_steps"] = previous_phase, previous_completed
+            if not persisted:
+                # No request was made (the save never completed, or we were
+                # cancelled before acquiring the lock). Retain this in-memory
+                # fact while storage is unavailable; the next pass must save it
+                # before attempting a write. If the process dies here, an
+                # on-disk inflight marker stays unknown.
+                outcome.clear()
+                outcome.update(previous_outcome)
+                if original:
+                    tx["phase"], tx["completed_steps"] = previous_phase, previous_completed
             raise
         try:
+            # The write request itself runs outside the owner lock; the durable
+            # inflight intent above was already persisted under the lock.
             response = await self.owner.client.balance_op(uid, Decimal(tx["amount"]), operation, notes)
             if (not isinstance(response, dict) or not _uid(response.get("id")) or response["id"] != uid
                     or "balance" not in response or not Decimal(str(response["balance"])).is_finite()):
@@ -505,7 +552,8 @@ class LedgerRecovery:
             tx["recovery"]["last_error"] = None
         if original:
             self._sync(tx)
-        self.owner._save()
+        async with self.owner._lock:
+            self.owner._save()
 
     async def _refund(self, tx):
         recovery = tx["recovery"]
@@ -518,31 +566,37 @@ class LedgerRecovery:
                 "key": operation_key(uid, tx["amount"], "add", notes),
                 "created_at": time.time(),
             }
-            recovery["refund"] = refund
-            self.owner._save()
+            async with self.owner._lock:
+                recovery["refund"] = refund
+                self.owner._save()
         if refund["status"] in ("inflight", "unknown"):
             found = await self._lookup(tx, uid, "add", notes, refund["created_at"])
             if found is False:
                 return
             if found is None:
-                refund["status"] = "unknown"
-                recovery["result"] = "waiting_evidence"
-                self.owner._save()
+                async with self.owner._lock:
+                    refund["status"] = "unknown"
+                    recovery["result"] = "waiting_evidence"
+                    self.owner._save()
                 return
-            refund.update(status="applied", evidence=found)
-            refund.pop("category", None)
-            self.owner._save()
+            async with self.owner._lock:
+                refund.update(status="applied", evidence=found)
+                refund.pop("category", None)
+                self.owner._save()
         elif refund["status"] in ("not_sent", "not_applied"):
+            # Persisted together with the inflight intent inside _send.
             recovery["result"] = "refunding"
             await self._send(tx, refund, uid, "add", notes)
         if refund["status"] == "applied":
-            tx["status"] = "resolved"
-            tx["resolution_note"] = "自动恢复：原扣款成功，收款步骤已确认未执行；已按原金额退回扣款账号，退款证据保存在 recovery.refund。"
-            recovery.update(result="refunded", last_error=None)
-            self.owner._save()
+            async with self.owner._lock:
+                tx["status"] = "resolved"
+                tx["resolution_note"] = "自动恢复：原扣款成功，收款步骤已确认未执行；已按原金额退回扣款账号，退款证据保存在 recovery.refund。"
+                recovery.update(result="refunded", last_error=None)
+                self.owner._save()
         else:
-            recovery["result"] = "waiting_retry" if refund["status"] == "not_applied" else "waiting_evidence"
-            self.owner._save()
+            async with self.owner._lock:
+                recovery["result"] = "waiting_retry" if refund["status"] == "not_applied" else "waiting_evidence"
+                self.owner._save()
 
     def _complete(self, tx):
         if tx["kind"] == "checkin":
@@ -593,10 +647,15 @@ class LedgerRecovery:
                 "last_error": (error if error in _ERRORS else None) if valid else "invalid_transaction",
                 "next_check_at": next_check if _number(next_check) else None,
             })
+        totals = getattr(self.owner.client, "history_totals", None)
+        # Evidence is capped at 20 pages x 100 rows; warn before a uid approaches it.
+        near_limit = sum(1 for total in totals.values()
+                         if type(total) is int and total >= 1800) if isinstance(totals, dict) else 0
         return {
             "checked_at": now, "pending_count": len(items), "recovered_count": recovered,
             "storage_failed": bool(self.owner._state_failed),
             "worker_enabled": self._enabled(), "transactions": items,
+            "history_near_limit": near_limit,
         }
 
     def _write_status(self, snapshot):

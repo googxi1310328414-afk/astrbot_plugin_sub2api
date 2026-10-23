@@ -306,6 +306,100 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.searches, ["user2@example.test"])
         self.assertEqual(self.bot.state["bindings"]["10001"]["uid"], 2)
 
+    async def _pending_checkin(self, plan):
+        """产生一条结果未知的待核对签到流水，返回 (tx, 用户收到的提示)。"""
+        self.client.plans = [plan]
+        reply = await self.invoke("checkin")
+        self.assertIn("待核对", reply)
+        tx = self.transactions()[0]
+        self.assertEqual((tx["status"], tx["kind"]), ("pending", "checkin"))
+        return tx, reply
+
+    async def test_audit_requires_admin_usage_and_eligible_transaction(self):
+        tx, _ = await self._pending_checkin("unknown_before")
+        txid = tx["id"]
+        for text in ("/核账", "/核账 abc", "/核账 " + txid + " maybe",
+                     "/核账 zzz" + "0" * 29 + " not_applied"):
+            with self.subTest(text=text):
+                self.assertIn("用法", await self.invoke("audit", Event(admin=True, text=text)))
+        self.assertIn("没有找到待核对状态", await self.invoke(
+            "audit", Event(admin=True, text="/核账 " + "b" * 32 + " not_applied")))
+        # 非管理员拒绝，且零 API 调用、零状态变更
+        before = copy.deepcopy(self.bot.state)
+        denied = await self.invoke("audit", Event(text="/核账 " + txid + " not_applied"))
+        self.assertIn("只有 AstrBot 管理员", denied)
+        self.assertEqual(self.bot.state, before)
+        # /核账 全程零 API 调用；reads 里的 [1] 仅来自先前那次签到尝试的账号预检。
+        self.assertEqual(self.client.reads, [1])
+        self.assertEqual(self.client.searches, [])
+        self.assertEqual(len(self.client.operations), 1)  # 只有先前那次签到尝试
+
+    async def test_audit_rejects_rob_and_non_unknown_transactions(self):
+        self.client.plans = [None, "unknown_after"]
+        with patch.object(plugin.random, "random", return_value=0.9):
+            await self.invoke("rob", Event(targets=("10002",)))
+        rob_tx = self.transactions()[0]
+        self.assertEqual(rob_tx["status"], "pending")
+        refused = await self.invoke("audit", Event(admin=True, text=f"/核账 {rob_tx['id']} not_applied"))
+        self.assertIn("两步资金操作", refused)
+        self.assertEqual(rob_tx["status"], "pending")
+        # 没有 unknown/inflight 步骤的流水拒绝受理
+        manual = {"id": "c" * 32, "kind": "checkin", "qq": "10001", "uids": [1], "date": "2026-10-01",
+                  "amount": "0.300", "steps": [{"uid": 1, "operation": "add"}],
+                  "balances_before": {"1": "2.000"}, "status": "pending", "phase": "intent",
+                  "completed_steps": 0, "created_at": plugin.time.time(),
+                  "step_outcomes": [{"status": "not_sent"}]}
+        self.bot.state["transactions"][manual["id"]] = manual
+        self.assertIn("没有结果未知的步骤", await self.invoke(
+            "audit", Event(admin=True, text=f"/核账 {manual['id']} not_applied")))
+        self.assertEqual(manual["status"], "pending")
+
+    async def test_audit_not_applied_resolves_and_allows_fresh_checkin(self):
+        tx, reply = await self._pending_checkin("unknown_before")
+        self.assertNotIn("系统自动核对中", reply)
+        self.assertIn("需管理员核对", reply)
+        result = await self.invoke("audit", Event(admin=True, text=f"/核账 {tx['id']} not_applied"))
+        self.assertIn("未执行", result)
+        self.assertEqual(tx["status"], "resolved")
+        self.assertTrue(tx["resolution_note"].strip())
+        # 不补签到标记；用户可重新 /签到 补领，余额只加一次
+        self.assertEqual(self.bot.state["checkin"], {})
+        self.assertEqual(self.bot.state["checkin_uid"], {})
+        again = await self.invoke("checkin")
+        self.assertIn("签到成功", again)
+        self.assertEqual(len(self.client.operations), 2)
+        self.assertEqual(self.client.users[1]["balance"], Decimal("2.300"))
+        saved = plugin.load_state(str(self.path))
+        self.assertEqual(saved["transactions"][tx["id"]]["status"], "resolved")
+        self.assertEqual(saved["checkin"]["10001"], saved["checkin_uid"]["1"])
+
+    async def test_audit_applied_backfills_checkin_markers_with_max_semantics(self):
+        self.client.plans = ["unknown_after"]
+        tx, _ = await self._pending_checkin("unknown_after")
+        # 请求实际已到账（unknown_after 在写入后才丢响应）
+        self.assertEqual(self.client.users[1]["balance"], Decimal("2.300"))
+        result = await self.invoke("audit", Event(admin=True, text=f"/核账 {tx['id']} applied"))
+        self.assertIn("已到账", result)
+        self.assertEqual(tx["status"], "resolved")
+        # 取较新日期、不回退：已有更新的签到标记时保持不变
+        self.assertEqual(self.bot.state["checkin"]["10001"], tx["date"])
+        self.assertEqual(self.bot.state["checkin_uid"]["1"], tx["date"])
+        self.assertIn("已经签过", await self.invoke("checkin"))
+        self.assertEqual(len(self.client.operations), 1)
+        self.assertEqual(self.client.users[1]["balance"], Decimal("2.300"))
+        # 已 resolved 的流水不能再裁决
+        self.assertIn("没有找到待核对状态", await self.invoke(
+            "audit", Event(admin=True, text=f"/核账 {tx['id']} applied")))
+
+    async def test_audit_applied_never_rolls_back_newer_checkin_marker(self):
+        self.client.plans = ["unknown_after"]
+        tx, _ = await self._pending_checkin("unknown_after")
+        self.bot.state["checkin"]["10001"] = "2099-01-01"
+        self.bot.state["checkin_uid"]["1"] = "2099-01-01"
+        await self.invoke("audit", Event(admin=True, text=f"/核账 {tx['id']} applied"))
+        self.assertEqual(self.bot.state["checkin"]["10001"], "2099-01-01")
+        self.assertEqual(self.bot.state["checkin_uid"]["1"], "2099-01-01")
+
     async def test_binding_save_failure_latches_and_never_grants_balance_access(self):
         self.bot.state["bindings"] = {}
         self.bot._save()
@@ -651,7 +745,8 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.client.users[1]["balance"], Decimal(own_after))
                 self.assertEqual(self.client.users[2]["balance"], Decimal(target_after))
                 self.assertEqual(len(self.bot.state["transactions"]), 1 if writes else 0)
-                self.assertIn("10001", self.bot.state["robbery_ts"])
+                # v1.6.2 起：零余额成功不进入冷却；只有真实转账（成功抢到/失败赔款）才写冷却。
+                self.assertEqual("10001" in self.bot.state["robbery_ts"], writes > 0)
                 self.assertEqual(self.recall.messages, [])
 
     async def test_insufficient_compensation_is_rejected_before_randomness(self):
@@ -1050,6 +1145,56 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(plugin.StateError):
             plugin.load_state(str(self.path))
 
+    def make_terminal_tx(self, txid, status="completed", age_days=0):
+        stamp = plugin.time.time() - age_days * 86400
+        tx = {"id": txid, "kind": "checkin", "qq": "10001", "uids": [1], "date": "2026-09-15",
+              "amount": "0.300", "steps": [{"uid": 1, "operation": "add"}],
+              "balances_before": {"1": "2.000"}, "status": status,
+              "phase": "committed" if status == "completed" else "intent",
+              "completed_steps": 1 if status == "completed" else 0, "created_at": stamp}
+        if status == "completed":
+            tx["completed_at"] = stamp
+        if status == "resolved":
+            tx["resolution_note"] = "管理员核账：测试。"
+        return tx
+
+    def test_load_state_archives_only_stale_terminal_transactions(self):
+        state = copy.deepcopy(self.bot.state)
+        state["transactions"] = {
+            "a" * 32: self.make_terminal_tx("a" * 32, "completed", age_days=40),
+            "b" * 32: self.make_terminal_tx("b" * 32, "resolved", age_days=40),
+            "c" * 32: self.make_terminal_tx("c" * 32, "failed", age_days=40),
+            "d" * 32: self.make_terminal_tx("d" * 32, "completed", age_days=1),
+            "e" * 32: self.make_terminal_tx("e" * 32, "pending", age_days=40),
+        }
+        self.path.write_text(json.dumps(state), encoding="utf-8")
+        loaded = plugin.load_state(str(self.path), 30)
+        self.assertEqual(set(loaded["transactions"]), {"d" * 32, "e" * 32})
+        archive = json.loads(self.path.with_name("ledger_archive.json").read_text(encoding="utf-8"))
+        self.assertEqual(set(archive["transactions"]), {"a" * 32, "b" * 32, "c" * 32})
+        # 磁盘 state.json 未动；重复加载幂等（按 txid 覆盖，不产生重复条目）
+        self.assertEqual(set(plugin.load_state(str(self.path))["transactions"]),
+                         {"a" * 32, "b" * 32, "c" * 32, "d" * 32, "e" * 32})
+        again = plugin.load_state(str(self.path), 30)
+        self.assertEqual(set(again["transactions"]), {"d" * 32, "e" * 32})
+        archive = json.loads(self.path.with_name("ledger_archive.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(archive["transactions"]), 3)
+        self.assertEqual(archive["version"], 1)
+        self.assertEqual(list(self.path.parent.glob("*.tmp")), [])
+
+    def test_load_state_fails_closed_on_corrupt_archive(self):
+        state = copy.deepcopy(self.bot.state)
+        state["transactions"] = {"a" * 32: self.make_terminal_tx("a" * 32, "completed", age_days=40)}
+        self.path.write_text(json.dumps(state), encoding="utf-8")
+        for content in ("broken", "[]", '{"version": 2, "transactions": {}}',
+                        '{"version": 1, "transactions": {"x": {"id": "y"}}}'):
+            with self.subTest(content=content):
+                self.path.with_name("ledger_archive.json").write_text(content, encoding="utf-8")
+                with self.assertRaises(plugin.StateError):
+                    plugin.load_state(str(self.path), 30)
+        self.assertEqual(self.path.with_name("ledger_archive.json").read_text(encoding="utf-8"),
+                         '{"version": 1, "transactions": {"x": {"id": "y"}}}')
+
     def test_corrupt_state_fails_closed_without_overwriting(self):
         for content in ("broken json", "null", "[]", '{"bindings":{}}'):
             with self.subTest(content=content):
@@ -1094,7 +1239,11 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
     def test_defaults_do_not_embed_credentials_and_config_validates(self):
         self.assertEqual(self.bot.cfg["admin_email"], "")
         self.assertEqual(self.bot.cfg["admin_password"], "")
-        for config in ({"robbery_cooldown": -1}, {"robbery_cooldown": True}, {"allow_bind_admin": "false"}):
+        for config in ({"robbery_cooldown": -1}, {"robbery_cooldown": True}, {"allow_bind_admin": "false"},
+                       {"write_timeout_seconds": 4}, {"write_timeout_seconds": 121},
+                       {"write_timeout_seconds": "30"}, {"write_timeout_seconds": True},
+                       {"transaction_retention_days": 0}, {"transaction_retention_days": 3651},
+                       {"transaction_retention_days": True}):
             with self.subTest(config=config), self.assertRaises(ValueError):
                 plugin.Sub2ApiPlugin(object(), config)
 
