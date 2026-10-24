@@ -45,7 +45,12 @@
     "default": 30
   },
   "write_timeout_seconds": {
-    "description": "sub2api API 请求总超时秒数（5 至 120，默认 30），连接超时固定 5 秒；写请求超时仍记为结果未知，绝不自动重发",
+    "description": "写请求（余额加减）总超时秒数（5 至 120，默认 30），连接超时固定 5 秒；写请求超时仍记为结果未知，绝不自动重发",
+    "type": "int",
+    "default": 30
+  },
+  "read_timeout_seconds": {
+    "description": "只读 GET 请求（如签到前的账号预检）总超时秒数（5 至 120，默认 30）；GET 幂等且无账务副作用，超时或传输层失败会自动重试一次，超时提示与写路径分开；写请求不受此项影响",
     "type": "int",
     "default": 30
   },

@@ -5,6 +5,7 @@ The fake credentials below belong only to this test server. No environment file,
 AstrBot instance, external network endpoint, or production balance is accessed.
 """
 
+import asyncio
 import importlib.util
 import socket
 import sys
@@ -171,7 +172,24 @@ class HttpSimulationTests(unittest.IsolatedAsyncioTestCase):
 
     async def _user(self, request):
         await self._record(request)
-        planned = self._failure_response(self._take_plan("user"))
+        plan = self._take_plan("user")
+        if plan == "drop":
+            # 传输层中断：连接在响应写回前被服务端关闭。注意 aiohttp 对幂等 GET 的
+            # ServerDisconnectedError 会在单次 session.request 内部自动重发一次。
+            request.transport.close()
+            return web.Response()
+        if plan == "partial":
+            # 响应头 200 后传输中途断开：客户端读体时抛 ClientPayloadError
+            # （非超时传输层失败，aiohttp 不会对其内部重试）。
+            response = web.StreamResponse(headers={"Content-Type": "application/json"})
+            await response.prepare(request)
+            await response.write(b'{"data": {"id": ')
+            request.transport.close()
+            return response
+        if plan == "sleep":
+            # 模拟上游账号查询被 IO 争用拖慢（超时类传输层失败）。
+            await asyncio.sleep(1.2)
+        planned = self._failure_response(plan)
         if planned is not None:
             return planned
         if not self._authenticated(request):
@@ -187,6 +205,9 @@ class HttpSimulationTests(unittest.IsolatedAsyncioTestCase):
         if not key:
             return web.json_response({"message": "Idempotency-Key is required"}, status=400)
         plan = self._take_plan("balance")
+        if plan == "sleep":
+            # 模拟写请求超时：客户端断开后服务端仍在处理。
+            await asyncio.sleep(1.2)
         if isinstance(plan, dict):
             return self._failure_response(plan)
         if isinstance(plan, int) and not 200 <= plan < 300:
@@ -645,13 +666,20 @@ class HttpSimulationTests(unittest.IsolatedAsyncioTestCase):
                 self._assert_sanitized(raised.exception)
         self.assertEqual(self._calls("/7/balance"), [])
 
-    async def test_client_timeout_splits_connect_and_total(self):
+    async def test_client_timeout_splits_connect_total_and_read(self):
         default = plugin.Sub2ApiClient("http://127.0.0.1:1/api/v1", EMAIL, PASSWORD)
         self.assertEqual((default.timeout.total, default.timeout.connect), (30, 5))
+        self.assertEqual((default.read_timeout.total, default.read_timeout.connect), (30, 5))
         tuned = plugin.Sub2ApiClient("http://127.0.0.1:1/api/v1", EMAIL, PASSWORD, timeout_seconds=7)
-        self.assertEqual((tuned.timeout.total, tuned.timeout.connect), (7, 5))
+        self.assertEqual((tuned.timeout.total, tuned.read_timeout.total), (7, 7))
+        split = plugin.Sub2ApiClient("http://127.0.0.1:1/api/v1", EMAIL, PASSWORD,
+                                     timeout_seconds=7, read_timeout_seconds=9)
+        self.assertEqual((split.timeout.total, split.read_timeout.total), (7, 9))
+        self.assertEqual((split.timeout.connect, split.read_timeout.connect), (5, 5))
         with self.assertRaises(ValueError):
             plugin.Sub2ApiClient("http://127.0.0.1:1/api/v1", EMAIL, PASSWORD, timeout_seconds=0)
+        with self.assertRaises(ValueError):
+            plugin.Sub2ApiClient("http://127.0.0.1:1/api/v1", EMAIL, PASSWORD, read_timeout_seconds=0)
 
     async def test_history_lookup_records_total_for_near_limit_monitoring(self):
         self.history = [self._ledger_record(id=1000 + i, notes=f"other:{i}") for i in range(100)]
@@ -659,6 +687,82 @@ class HttpSimulationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(await self._lookup())
         self.assertEqual(self.client.history_totals, {7: 101})
         self.assertEqual(self.mutations, [])
+
+    def _slow_client(self, *, write=None, read=None):
+        return plugin.Sub2ApiClient(
+            self.client.base, EMAIL, PASSWORD,
+            timeout_seconds=5 if write is None else write,
+            read_timeout_seconds=5 if read is None else read,
+        )
+
+    async def test_get_transport_failure_retries_once_and_recovers(self):
+        # 签到前的只读账号预检 GET 在传输层断开时自动重试一次（幂等、无账务副作用）。
+        self.plans["user"] = ["partial"]
+        self.assertEqual((await self.client.get_user(7))["id"], 7)
+        self.assertEqual(len(self._calls("/users/7")), 2)
+        self.assertEqual(self.mutations, [])
+
+    async def test_get_transport_failure_after_retry_keeps_default_message(self):
+        self.plans["user"] = ["partial", "partial"]
+        with self.assertRaises(plugin.ApiError) as raised:
+            await self.client.get_user(7)
+        self.assertEqual(str(raised.exception), "sub2api 服务暂时不可用，请稍后重试。")
+        self.assertEqual(raised.exception.category, "request_rejected")
+        self.assertTrue(raised.exception.known_not_applied)
+        self._assert_sanitized(raised.exception)
+        self.assertEqual(len(self._calls("/users/7")), 2)
+        self.assertEqual(self.mutations, [])
+
+    async def test_get_timeout_retries_once_and_recovers(self):
+        # 重试命中已暖起来的路径（上游慢查询首次已把热数据读进缓存）即可救回。
+        self.client = self._slow_client(read=0.4)
+        self.plans["user"] = ["sleep"]
+        self.assertEqual((await self.client.get_user(7))["id"], 7)
+        self.assertEqual(len(self._calls("/users/7")), 2)
+
+    async def test_get_timeout_after_retry_reports_read_timeout(self):
+        self.client = self._slow_client(read=0.4)
+        self.plans["user"] = ["sleep", "sleep"]
+        with self.assertRaises(plugin.ApiError) as raised:
+            await self.client.get_user(7)
+        self.assertEqual(str(raised.exception), "账号数据查询超时，请稍后重试。")
+        self.assertEqual(raised.exception.category, "read_timeout")
+        self.assertTrue(raised.exception.known_not_applied)
+        self._assert_sanitized(raised.exception)
+        self.assertEqual(len(self._calls("/users/7")), 2)
+        self.assertEqual(self.mutations, [])
+
+    async def test_get_401_refresh_and_transport_retry_are_independent(self):
+        # 401 刷新 token 一次与 GET 传输层重试一次互不挤占：401 后断开仍可重试成功。
+        # 无论 aiohttp 是否在单次请求内对断开自动重发，本用例均为 3 个请求、2 次登录。
+        self.plans["user"] = [401, "drop"]
+        self.assertEqual((await self.client.get_user(7))["id"], 7)
+        self.assertEqual(len(self._calls("/users/7")), 3)
+        self.assertEqual(self.login_count, 2)
+
+    async def test_write_timeout_is_unknown_and_never_retried(self):
+        # 账务铁律：写请求传输层失败（含超时）只判结果未知，绝不自动重发。
+        self.client = self._slow_client(write=0.4)
+        self.plans["balance"] = ["sleep"]
+        with self.assertRaises(plugin.OutcomeUnknown) as raised:
+            await self.client.balance_op(7, 0.125, "add", "simulation write timeout")
+        self.assertFalse(raised.exception.known_not_applied)
+        self._assert_sanitized(raised.exception)
+        self.assertEqual(len(self._calls("/7/balance")), 1)
+        self.assertEqual(self.mutations, [])
+
+    async def test_get_connection_refused_keeps_connector_message(self):
+        await self.client._token_valid()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as unavailable:
+            unavailable.bind(("127.0.0.1", 0))
+            self.client.base = f"http://127.0.0.1:{unavailable.getsockname()[1]}/api/v1"
+            with self.assertRaises(plugin.ApiError) as raised:
+                await self.client.get_user(7)
+        self.assertNotIsInstance(raised.exception, plugin.OutcomeUnknown)
+        self.assertEqual(raised.exception.category, "connector_not_sent")
+        self.assertTrue(raised.exception.known_not_applied)
+        self._assert_sanitized(raised.exception)
+        self.assertEqual(self._calls("/users/7"), [])
 
 
 if __name__ == "__main__":

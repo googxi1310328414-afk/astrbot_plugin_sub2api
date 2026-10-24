@@ -49,6 +49,7 @@ DEFAULT_CONFIG = {
     "recovery_enabled": True,
     "recovery_interval_seconds": 30,
     "write_timeout_seconds": 30,
+    "read_timeout_seconds": 30,
     "transaction_retention_days": 30,
 }
 
@@ -348,7 +349,8 @@ def save_state(state: dict, path=None):
 
 
 class Sub2ApiClient:
-    def __init__(self, base_url: str, email: str, password: str, timeout_seconds: int = 30):
+    def __init__(self, base_url: str, email: str, password: str, timeout_seconds: int = 30,
+                 read_timeout_seconds=None):
         self.base = base_url.rstrip("/")
         parsed = urlsplit(self.base)
         if (parsed.scheme not in ("http", "https") or not parsed.hostname
@@ -358,10 +360,19 @@ class Sub2ApiClient:
         self.password = password
         # 连接超时与总超时拆分：网关不可达时 5 秒内失败，慢而可达的写请求允许跑满总超时。
         # 写请求超时仍判为结果未知，绝不自动重发（账务铁律不变）。
+        # 只读 GET（如签到前的 /admin/users/{uid} 预检）与写超时解耦、单独可配：
+        # GET 幂等且失败无账务副作用，可给更长超时并在传输层失败后自动重试一次。
         if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
                 or not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
             raise ValueError("sub2api 请求超时配置必须为正数。")
+        if read_timeout_seconds is None:
+            read_timeout_seconds = timeout_seconds
+        if (isinstance(read_timeout_seconds, bool) or not isinstance(read_timeout_seconds, (int, float))
+                or not math.isfinite(read_timeout_seconds) or read_timeout_seconds <= 0):
+            raise ValueError("sub2api 只读请求超时配置必须为正数。")
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds, connect=min(5, timeout_seconds))
+        self.read_timeout = aiohttp.ClientTimeout(total=read_timeout_seconds,
+                                                  connect=min(5, read_timeout_seconds))
         # 每个 uid 最近一次账务历史总条数（只读观测，供核账监控接近 2000 条上限告警）。
         self.history_totals = {}
         self._token = ""
@@ -402,18 +413,28 @@ class Sub2ApiClient:
     async def _req(self, method: str, path: str, body=None, params=None, headers=None) -> tuple[int, dict]:
         token = await self._token_valid()
         is_write = method.upper() != "GET"
-        for attempt in (1, 2):
+        # 只读 GET 幂等且无账务副作用：传输层/超时失败自动重试一次（首次尝试往往已把
+        # 上游热数据读进缓存，实测二次请求常命中暖缓存快速返回）。写请求绝不自动重试
+        # （账务铁律：结果未知只查询、不重发）。拒连同样不重试：连接尚未建立，
+        # 立即重发只会重复失败，保留"本次操作未执行"的确定性文案。
+        read_retries_left = 0 if is_write else 1
+        refreshed = False
+        timed_out = False
+        # 硬上限 5 次尝试：正常最多 3 次（401 刷新一次 + GET 传输层重试一次）。
+        for _ in range(5):
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.request(
                         method, f"{self.base}{path}", json=body, params=params,
                         headers={**(headers or {}), "Authorization": f"Bearer {token}"},
-                        timeout=self.timeout, allow_redirects=False,
+                        timeout=self.read_timeout if not is_write else self.timeout,
+                        allow_redirects=False,
                     ) as response:
                         code = response.status
-                        if code == 401 and attempt == 1:
+                        if code == 401 and not refreshed:
                             self._token = ""
                             token = await self._token_valid()
+                            refreshed = True
                             continue
                         if code != 200:
                             # 此完整错误来自已核验的原子条件 UPDATE 未命中分支。
@@ -444,10 +465,28 @@ class Sub2ApiClient:
                 # 连接尚未建立，当前这一次请求不可能到达余额处理器。
                 raise ApiError("无法连接余额服务，本次操作未执行，请稍后重试。",
                                category="connector_not_sent") from None
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError, TypeError):
+            except (aiohttp.ContentTypeError, ValueError, TypeError):
+                # 响应内容类型不是 JSON 或响应体无法解析：服务端行为异常而非
+                # 传输层抖动，重试无意义。
                 if is_write:
                     raise OutcomeUnknown(category="transport_or_response_unconfirmed") from None
                 raise ApiError() from None
+            except asyncio.TimeoutError:
+                timed_out = True
+            except (aiohttp.ClientError, OSError):
+                timed_out = False
+            if is_write:
+                raise OutcomeUnknown(category="transport_or_response_unconfirmed") from None
+            if read_retries_left > 0:
+                read_retries_left -= 1
+                continue
+            # GET 超时与服务不可用分开提示：超时通常是上游查询偶发变慢，
+            # 稍后重试确实可能成功；其它传输层异常维持通用文案。
+            raise ApiError(
+                "账号数据查询超时，请稍后重试。" if timed_out
+                else "sub2api 服务暂时不可用，请稍后重试。",
+                category="read_timeout" if timed_out else "request_rejected",
+            ) from None
         raise ApiError("sub2api 身份验证失败，请管理员检查配置。", 401)
 
     async def find_user_by_email(self, email: str) -> dict | None:
@@ -861,7 +900,7 @@ def render_group_cards(rows: list, generated: str) -> str:
     return path
 
 
-@register("astrbot_plugin_sub2api", "zcode", "sub2api 余额互动：自动核账恢复与额度撤回", "1.6.2")
+@register("astrbot_plugin_sub2api", "zcode", "sub2api 余额互动：自动核账恢复与额度撤回", "1.6.3")
 class Sub2ApiPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -884,11 +923,14 @@ class Sub2ApiPlugin(Star):
             raise ValueError("recovery_interval_seconds 必须为 10 至 900 的整数。")
         if type(cfg["write_timeout_seconds"]) is not int or not 5 <= cfg["write_timeout_seconds"] <= 120:
             raise ValueError("write_timeout_seconds 必须为 5 至 120 的整数。")
+        if type(cfg["read_timeout_seconds"]) is not int or not 5 <= cfg["read_timeout_seconds"] <= 120:
+            raise ValueError("read_timeout_seconds 必须为 5 至 120 的整数。")
         if type(cfg["transaction_retention_days"]) is not int or not 1 <= cfg["transaction_retention_days"] <= 3650:
             raise ValueError("transaction_retention_days 必须为 1 至 3650 的整数。")
         self.cfg = cfg
         self.client = Sub2ApiClient(cfg["base_url"], cfg["admin_email"], cfg["admin_password"],
-                                    timeout_seconds=cfg["write_timeout_seconds"])
+                                    timeout_seconds=cfg["write_timeout_seconds"],
+                                    read_timeout_seconds=cfg["read_timeout_seconds"])
         self.state_path = STATE_FILE
         self.state = load_state(self.state_path, cfg["transaction_retention_days"])
         # 所有命令共用一把锁，覆盖绑定、检查、账务请求与状态落盘。

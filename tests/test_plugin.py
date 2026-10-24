@@ -536,6 +536,19 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("签到成功", await self.invoke("checkin"))
         self.assertEqual(self.client.users[1]["balance"], Decimal("2.300"))
 
+    async def test_checkin_read_timeout_message_reaches_user_without_journal(self):
+        # 签到前置 GET 超时（含自动重试后仍失败）：细分文案直接透出，
+        # 且发生在任何流水写入之前——无状态残留，用户稍后重试安全。
+        async def slow_lookup(uid):
+            raise plugin.ApiError("账号数据查询超时，请稍后重试。", category="read_timeout")
+        self.client.get_user = slow_lookup
+        result = await self.invoke("checkin")
+        self.assertIn("账号数据查询超时，请稍后重试。", result)
+        self.assertNotIn("签到成功", result)
+        self.assertEqual(self.client.operations, [])
+        self.assertEqual(self.transactions(), [])
+        self.assertEqual(self.bot.state["checkin"], {})
+
     async def test_save_before_request_failure_has_zero_writes_and_latches(self):
         with patch.object(plugin, "save_state", side_effect=plugin.StateError("state unavailable")):
             await self.invoke("checkin")
@@ -1239,9 +1252,12 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
     def test_defaults_do_not_embed_credentials_and_config_validates(self):
         self.assertEqual(self.bot.cfg["admin_email"], "")
         self.assertEqual(self.bot.cfg["admin_password"], "")
+        self.assertEqual(self.bot.cfg["read_timeout_seconds"], 30)
         for config in ({"robbery_cooldown": -1}, {"robbery_cooldown": True}, {"allow_bind_admin": "false"},
                        {"write_timeout_seconds": 4}, {"write_timeout_seconds": 121},
                        {"write_timeout_seconds": "30"}, {"write_timeout_seconds": True},
+                       {"read_timeout_seconds": 4}, {"read_timeout_seconds": 121},
+                       {"read_timeout_seconds": "30"}, {"read_timeout_seconds": True},
                        {"transaction_retention_days": 0}, {"transaction_retention_days": 3651},
                        {"transaction_retention_days": True}):
             with self.subTest(config=config), self.assertRaises(ValueError):
