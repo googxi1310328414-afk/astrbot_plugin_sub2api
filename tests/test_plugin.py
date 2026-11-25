@@ -1,8 +1,10 @@
 """Offline command and durable-state simulations; no real account or network access."""
 import asyncio
+import contextlib
 import copy
 import importlib.util
 import json
+import re
 import sys
 import tempfile
 import types
@@ -11,6 +13,8 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+
+from PIL import Image, ImageDraw, ImageFont
 
 
 def load_plugin():
@@ -104,6 +108,9 @@ class Event:
     def plain_result(self, text):
         return text
 
+    def image_result(self, path):
+        return f"[image] {path}"
+
 
 class FakeClient:
     def __init__(self):
@@ -146,6 +153,42 @@ class FakeClient:
         if plan == "cancel_after":
             raise asyncio.CancelledError
         return copy.deepcopy(user)
+
+
+class FakeOpsClient:
+    """Read-only ops endpoints whose scale fields must never reach users or the LLM."""
+
+    def __init__(self, groups, snapshots=None, availability=None, failing=()):
+        self.groups, self.snapshots = groups, snapshots or {}
+        self.availability, self.failing = availability or {}, set(failing)
+        self.calls = []
+
+    async def get_ops_list(self, path):
+        self.calls.append((path, None))
+        await asyncio.sleep(0)
+        return copy.deepcopy(self.groups)
+
+    async def get_ops(self, path, params=None):
+        self.calls.append((path, params))
+        await asyncio.sleep(0)
+        if path == "/admin/ops/account-availability":
+            return {"group": copy.deepcopy(self.availability)}
+        if params["group_id"] in self.failing:
+            raise plugin.ApiError("SIMULATED_PRIVATE_OPS_FAILURE")
+        return copy.deepcopy(self.snapshots.get(params["group_id"], {}))
+
+    def snapshot_ids(self):
+        return [params["group_id"] for path, params in self.calls
+                if path == "/admin/ops/dashboard/snapshot-v2"]
+
+
+def ops_snapshot(total, success, health=90, points=()):
+    return {
+        "overview": {"request_count_total": total, "success_count": success, "health_score": health,
+                     "account_count": 37, "qps": 12.5, "token_count": 987654},
+        "throughput_trend": {"points": [{"request_count": requests} for requests, _ in points]},
+        "error_trend": {"points": [{"error_count_total": errors} for _, errors in points]},
+    }
 
 
 class PluginTests(unittest.IsolatedAsyncioTestCase):
@@ -496,6 +539,16 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已经签过", await self.invoke("checkin"))
         self.assertIn("已经签过", await self.invoke("checkin", Event(qq="10002")))
         self.assertEqual(len(self.client.operations), 1)
+
+    async def test_repeat_checkin_is_answered_locally_without_account_read(self):
+        self.assertIn("签到成功", await self.invoke("checkin"))
+        self.assertEqual(self.client.reads, [1])
+        # 重复签到不应再请求管理 API：上游不可用时也直接得到"已签过"。
+        self.client.get_user = AsyncMock(side_effect=AssertionError("repeat check-in read the account"))
+        self.assertIn("已经签过", await self.invoke("checkin"))
+        self.client.get_user.assert_not_called()
+        self.assertEqual(len(self.client.operations), 1)
+        self.assertEqual(len(self.transactions()), 1)
 
     async def test_checkin_resets_at_shanghai_midnight(self):
         with patch.object(plugin, "datetime", wraps=datetime) as clock:
@@ -1262,6 +1315,214 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                        {"transaction_retention_days": True}):
             with self.subTest(config=config), self.assertRaises(ValueError):
                 plugin.Sub2ApiPlugin(object(), config)
+
+    async def test_status_command_needs_no_binding_and_never_waits_for_wallet_lock(self):
+        self.bot.client = FakeOpsClient(
+            [{"id": 1, "name": "Alpha", "status": "active", "platform": "openai"}],
+            snapshots={1: ops_snapshot(100, 99)},
+        )
+        before = copy.deepcopy(self.bot.state)
+        with patch.object(plugin, "render_group_cards", return_value="/fake/status.png") as render:
+            async with self.bot._lock:  # 账务指令进行中：/状态 只读，不应排队等锁
+                result = await asyncio.wait_for(
+                    self.invoke("status", Event(qq="10009", text="/状态")), 1)
+        self.assertEqual(result, "[image] /fake/status.png")
+        rows, generated = render.call_args.args
+        self.assertEqual([row["name"] for row in rows], ["Alpha"])
+        self.assertRegex(generated, r"\A\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\Z")
+        self.assertEqual(self.bot.state, before)
+        self.assertFalse(self.path.exists())
+
+    async def test_status_command_replies_text_without_public_groups_or_on_failure(self):
+        self.bot.client = FakeOpsClient(
+            [{"id": 5, "name": "VIP", "status": "active", "is_exclusive": True},
+             {"id": 4, "name": "Retired", "status": "disabled"}])
+        with patch.object(plugin, "render_group_cards") as render:
+            self.assertEqual(await self.invoke("status", Event(text="/状态")), "当前没有可展示的公开分组。")
+        render.assert_not_called()
+        self.assertEqual(self.bot.client.snapshot_ids(), [])
+        self.bot.client.get_ops_list = AsyncMock(side_effect=plugin.ApiError("sub2api 监控数据响应异常，请联系管理员。"))
+        self.assertEqual(await self.invoke("status", Event(text="/状态")), "sub2api 监控数据响应异常，请联系管理员。")
+        self.bot.client.get_ops_list = AsyncMock(side_effect=RuntimeError("SIMULATED_PRIVATE_DETAIL"))
+        self.assertEqual(await self.invoke("status", Event(text="/状态")), "监控卡片生成失败，请稍后重试或联系管理员。")
+
+
+class GroupStatusTests(unittest.IsolatedAsyncioTestCase):
+    """/状态 卡片与 LLM 工具的脱敏口径（AGENTS.md 红线 6）：只有分组级百分比，没有规模数据。"""
+
+    GROUPS = [
+        {"id": 1, "name": "Alpha", "status": "active", "platform": "openai", "rate_multiplier": 1.5},
+        {"id": 2, "name": "Beta", "status": "active", "platform": "anthropic"},
+        {"id": 3, "name": "Gamma", "status": "active", "platform": "gemini"},
+        {"id": 4, "name": "Retired", "status": "disabled", "platform": "openai"},
+        {"id": 5, "name": "VIP", "status": "active", "platform": "anthropic", "is_exclusive": True},
+        {"id": 6, "name": "Flaky", "status": "active", "platform": "openai"},
+    ]
+
+    def ops(self, groups=None):
+        return FakeOpsClient(self.GROUPS if groups is None else groups, snapshots={
+            1: ops_snapshot(1234, 1220, points=((5, 0), (0, 0), (3, 1))),
+            2: ops_snapshot(12, 9, health=40),
+            3: ops_snapshot(0, 0),
+            5: ops_snapshot(5000, 4999),
+        }, availability={
+            "1": {"total_accounts": 8, "available_count": 6, "rate_limit_count": 0, "error_count": 0},
+            "2": {"total_accounts": 3, "available_count": 1, "rate_limit_count": 2, "error_count": 0},
+        }, failing={6})
+
+    def public_groups(self):
+        return [group for group in self.GROUPS if not group.get("is_exclusive")]
+
+    async def test_success_rate_text_is_whitelisted_percentages_only(self):
+        client = self.ops(self.public_groups())
+        text = await plugin.collect_group_success_rates(client)
+        header, *lines = text.splitlines()
+        self.assertIn("仅百分比", header)
+        self.assertEqual(lines, ["Alpha:98.9%", "Beta:75.0%(样本少)",
+                                 "Gamma:近一小时无请求或数据暂缺", "Flaky:近一小时无请求或数据暂缺"])
+        for line in lines:
+            self.assertRegex(line, r"\A[^:]+:(\d{1,3}\.\d%(\(样本少\))?|近一小时无请求或数据暂缺)\Z")
+        for secret in ("1234", "1220", "987654", "12.5", "37", "SIMULATED", "Retired"):
+            self.assertNotIn(secret, text)
+        self.assertNotIn(4, client.snapshot_ids())
+
+    async def test_success_rate_keyword_filter_matches_case_insensitively(self):
+        client = self.ops(self.public_groups())
+        filtered = await plugin.collect_group_success_rates(client, "  ALP ")
+        self.assertEqual(filtered.splitlines()[1:], ["Alpha:98.9%"])
+        self.assertEqual(client.snapshot_ids(), [1])
+        self.assertTrue((await plugin.collect_group_success_rates(client, "不存在")).endswith("（没有匹配的启用分组）"))
+
+    async def test_llm_tool_caches_per_keyword_for_sixty_seconds_and_never_caches_failures(self):
+        bot = plugin.Sub2ApiPlugin.__new__(plugin.Sub2ApiPlugin)
+        bot.client = self.ops(self.public_groups())
+        now = [1000.0]
+        with patch.object(plugin, "time", types.SimpleNamespace(time=lambda: now[0])):
+            first = await bot.query_group_success_rate(Event(), "")
+            calls = len(bot.client.calls)
+            now[0] = 1059.0
+            self.assertEqual(await bot.query_group_success_rate(Event(), "  "), first)
+            self.assertEqual(len(bot.client.calls), calls)
+            self.assertEqual((await bot.query_group_success_rate(Event(), "alp")).splitlines()[1:], ["Alpha:98.9%"])
+            self.assertGreater(len(bot.client.calls), calls)
+            now[0] = 2000.0
+            bot.client.get_ops_list = AsyncMock(side_effect=plugin.ApiError("sub2api 监控数据响应异常，请联系管理员。"))
+            self.assertEqual(await bot.query_group_success_rate(Event(), ""),
+                             "查询失败：sub2api 监控数据响应异常，请联系管理员。")
+            bot.client.get_ops_list = AsyncMock(side_effect=RuntimeError("SIMULATED_PRIVATE_DETAIL"))
+            self.assertEqual(await bot.query_group_success_rate(Event(), ""), "查询失败，请稍后再试。")
+            del bot.client.get_ops_list
+            self.assertEqual(await bot.query_group_success_rate(Event(), ""), first)
+
+    async def test_status_rows_only_collect_public_active_groups(self):
+        client = self.ops()
+        rows = await plugin.build_group_rows(client)
+        self.assertEqual([row["name"] for row in rows], ["Beta", "Gamma", "Alpha", "Flaky"])
+        # 专属与停用分组连快照都不请求，数据不会进入卡片渲染流程。
+        self.assertEqual(client.snapshot_ids(), [1, 2, 3, 6])
+        beta, gamma, alpha, flaky = rows
+        self.assertEqual((alpha["rate"], alpha["health"], alpha["cells"]), (98.9, 90, ["ok", "none", "fail"]))
+        self.assertEqual((alpha["total"], alpha["avail"], alpha["multiplier"]), (8, 6, 1.5))
+        self.assertEqual((beta["rate"], beta["limit"]), (75.0, 2))
+        self.assertEqual((gamma["rate"], gamma["total"]), (None, 0))
+        self.assertEqual((flaky["rate"], flaky["health"], flaky["cells"]), (None, None, []))
+
+    def test_missing_metrics_are_muted_instead_of_alarming(self):
+        self.assertEqual(plugin._pct_color(None), plugin._MUTED)
+        self.assertEqual(plugin._health_color(None), plugin._MUTED)
+        self.assertEqual([plugin._health_color(score) for score in (80, 79, 50, 49, 0)],
+                         [plugin._GREEN, plugin._AMBER, plugin._AMBER, plugin._RED, plugin._RED])
+
+    def test_long_group_names_are_truncated_to_fit(self):
+        draw = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+        font = ImageFont.load_default(size=23)
+        self.assertEqual(plugin._fit_text(draw, "Alpha", font, 400), "Alpha")
+        name = "超长分组名称Long" * 20
+        fitted = plugin._fit_text(draw, name, font, 300)
+        self.assertTrue(fitted.endswith("…"))
+        self.assertTrue(name.startswith(fitted[:-1]))
+        self.assertLessEqual(draw.textlength(fitted, font=font), 300)
+
+    @staticmethod
+    def card_rows():
+        def row(name, total, avail, limit, error, rate, health, cells, multiplier=None):
+            return {"platform": "openai", "name": name, "multiplier": multiplier, "total": total,
+                    "avail": avail, "limit": limit, "error": error, "rate": rate, "health": health,
+                    "cells": cells}
+        return [  # 覆盖 正常 / 限流 / 无渠道 / 异常 四种状态胶囊与超长分组名
+            row("超长分组名称Long" * 20, 8, 6, 0, 0, 98.9, 90, ["ok", "none", "fail"] * 20, 1.5),
+            row("Beta", 3, 1, 2, 0, 75.0, 40, []),
+            row("Gamma", 0, 0, 0, 0, None, None, []),
+            row("Delta", 4, 2, 0, 1, 50.0, 20, ["fail"] * 60, 2),
+        ]
+
+    @contextlib.contextmanager
+    def card_sandbox(self):
+        """图片写入临时目录；测试机不一定有 Noto CJK，改用 Pillow 内置字体。"""
+        ticks = iter(range(1, 100))
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(plugin, "__file__", str(Path(directory) / "main.py")), \
+                patch.object(plugin, "time", types.SimpleNamespace(time=lambda: next(ticks))), \
+                patch.object(plugin, "_card_font",
+                             side_effect=lambda size, bold=True: ImageFont.load_default(size=size)):
+            yield Path(directory) / "status"
+
+    def test_status_card_renders_png_and_keeps_three_latest(self):
+        with self.card_sandbox() as status_dir:
+            paths = [plugin.render_group_cards(self.card_rows(), "2026-11-25 12:00:00") for _ in range(4)]
+            empty = plugin.render_group_cards([], "2026-11-25 12:00:00")
+            with Image.open(paths[-1]) as image:
+                self.assertEqual((image.format, image.size), ("PNG", (1180, 64 + 84 + 2 * 262 + 24 + 56)))
+            with Image.open(empty) as image:
+                self.assertEqual(image.size, (1180, 64 + 84 + 56))
+            self.assertEqual(sorted(path.name for path in status_dir.iterdir()),
+                             sorted(Path(path).name for path in [*paths[-2:], empty]))
+
+    def test_status_card_header_chips_do_not_overlap(self):
+        placed = []
+        chip = plugin._chip
+
+        def spy(draw, x, y, *args):
+            advance = chip(draw, x, y, *args)
+            placed.append((y, x, advance))
+            return advance
+
+        with self.card_sandbox(), patch.object(plugin, "_chip", side_effect=spy):
+            plugin.render_group_cards(self.card_rows(), "2026-11-25 12:00:00")
+        lines = {}
+        for y, x, advance in placed:
+            lines.setdefault(y, []).append((x, advance))
+        self.assertEqual([len(chips) for chips in lines.values()], [2, 2])
+        for chips in lines.values():
+            for (left, advance), (right, _) in zip(chips, chips[1:]):
+                # _chip 返回"胶囊宽度 + 8px 间距"；后一个胶囊必须从前一个的右边缘之后开始。
+                self.assertGreaterEqual(right, left + advance - 8)
+
+
+class RepositoryConsistencyTests(unittest.TestCase):
+    """AGENTS.md「修改代码的约定」：配置项与版本号多处声明必须同步。"""
+
+    root = Path(__file__).resolve().parents[1]
+
+    def test_config_schema_defaults_and_readme_table_stay_in_sync(self):
+        schema = json.loads((self.root / "_conf_schema.json").read_text(encoding="utf-8"))
+        readme = (self.root / "README.md").read_text(encoding="utf-8")
+        self.assertEqual(set(schema), set(plugin.DEFAULT_CONFIG))
+        schema_types = {"string": str, "int": int, "bool": bool}
+        for key, default in plugin.DEFAULT_CONFIG.items():
+            with self.subTest(key=key):
+                self.assertEqual(schema[key]["default"], default)
+                self.assertIs(type(default), schema_types[schema[key]["type"]])
+                self.assertTrue(f"| `{key}` |" in readme, f"README 配置表缺少 {key}")
+
+    def test_metadata_version_matches_register_decorator(self):
+        metadata = (self.root / "metadata.yaml").read_text(encoding="utf-8")
+        source = (self.root / "main.py").read_text(encoding="utf-8")
+        declared = re.search(r"^version:\s*v(\S+)\s*$", metadata, re.M)
+        registered = re.search(r'@register\([^)]*"(\d+\.\d+\.\d+)"\)', source)
+        self.assertIsNotNone(declared)
+        self.assertIsNotNone(registered)
+        self.assertEqual(declared.group(1), registered.group(1))
 
 
 if __name__ == "__main__":

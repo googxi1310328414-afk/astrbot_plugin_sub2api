@@ -6,13 +6,13 @@
 
 AstrBot 插件 `astrbot_plugin_sub2api`:QQ 群余额玩法(绑定/签到/打劫/查询)、`/状态` 公开分组监控卡片、LLM 脱敏工具 `query_group_success_rate`。
 
-- 仓库根目录 = 本文件所在目录
-- 插件本体在子目录 `astrbot_plugin_sub2api/`(AstrBot 要求插件为 `data/plugins/` 下的一个目录)
-- 运行时状态:插件目录下的 `state.json`(绑定、签到、流水)、`pending_recalls.json`、`recovery_status.json`、`status/`(卡片图片)
+- 仓库根目录 = 本文件所在目录 = 插件目录(平铺布局,`main.py` 在仓库根);`git clone` 到 `data/plugins/` 下即得到 AstrBot 要求的插件目录
+- 运行时状态:插件目录下的 `state.json`(绑定、签到、流水)、`ledger_archive.json`(超期终局流水归档)、`pending_recalls.json`、`recovery_status.json`、`status/`(卡片图片)
+- 账务核对与人工恢复手册:[docs/recovery.md](./docs/recovery.md)
 
 ## 硬性安全红线
 
-1. **绝不删除或重建 `state.json`**。它损坏时插件会拒绝加载——这是设计行为。恢复手段是从备份还原,不是重建。
+1. **绝不删除、重建或手工编辑 `state.json` 与 `ledger_archive.json`**。它们损坏时插件会拒绝加载——这是设计行为。恢复手段是从备份还原,不是重建;打劫流水的人工终局只能由人类管理员按 docs/recovery.md 执行。
 2. **凭据只存在于 AstrBot 插件配置**(`data/config/astrbot_plugin_sub2api_config.json` 或面板),绝不写入代码、仓库、命令行参数、日志或文档。
 3. **不要在群聊/普通日志输出任何用户余额明文**;额度明细走撤回机制。
 4. **单实例运行**。多实例共用一份状态文件会破坏账务一致性。
@@ -52,12 +52,18 @@ git clone https://github.com/googxi1310328414-afk/astrbot_plugin_sub2api.git
   "admin_email": "<专用管理员邮箱>",
   "admin_password": "<专用管理员密码>",
   "robbery_cooldown": 600,
+  "protection_switch_cooldown": 86400,
   "allow_bind_admin": false,
   "quota_recall_seconds": 5,
   "recovery_enabled": true,
-  "recovery_interval_seconds": 30
+  "recovery_interval_seconds": 30,
+  "write_timeout_seconds": 30,
+  "read_timeout_seconds": 30,
+  "transaction_retention_days": 30
 }
 ```
+
+`base_url`、`admin_email`、`admin_password` 需按实际填写,其余键可省略(使用默认值);各键含义与取值范围见 README 配置表。
 
 `base_url` 的取值取决于网络拓扑:AstrBot 非容器且 sub2api 在同机 → `127.0.0.1`;两容器同网络 → 容器名;AstrBot 容器经网桥访问宿主机 → 该网桥网关 IP。
 
@@ -85,7 +91,8 @@ docker logs --since 2m astrbot 2>&1 | grep "适配器已连接"   # NapCat 已�
 | --- | --- |
 | `/签到` 无反应 | AstrBot `wake_prefix` 缺 `/`;加回后重启 |
 | 提示"管理员登录失败" | 检查专用账号密码;首次使用需在面板完成合规确认(423) |
-| 提示"账务待核对(流水 …)" | 正常保护机制;后台按证据核账,勿手动改 state.json;服务端始终查无记录时由 AstrBot 管理员用 `/核账 流水号 not_applied\|applied` 裁决(仅限结果未知的单步签到流水) |
+| 提示"账务待核对(流水 …)" | 正常保护机制;后台按证据核账,勿手动改 state.json;服务端始终查无记录时由 AstrBot 管理员用 `/核账 流水号 not_applied\|applied` 裁决(仅限结果未知的单步签到流水)。查看 `recovery_status.json` 并按 docs/recovery.md 帮人类整理证据,不要替人类裁决 |
+| 提示"账号数据查询超时" | sub2api 只读查询偶发变慢(已自动重试一次);频繁出现时调大 `read_timeout_seconds` |
 | `/状态` 报字体缺失 | 容器安装 Noto Sans CJK |
 
 ## 升级 Runbook
@@ -99,7 +106,7 @@ docker restart astrbot                                              # 4. 重启
 # 5. 按上面"重载与验证"检查;失败则回滚:rm -rf 新目录 && cp -a 备份目录 原路径 && 重启
 ```
 
-版本号位于 `astrbot_plugin_sub2api/metadata.yaml` 与 `main.py` 的 `@register(...)` 第 4 参数,两处必须一致。
+版本号位于仓库根的 `metadata.yaml`(`version: vX.Y.Z`)与 `main.py` 的 `@register(...)` 第 4 参数(`"X.Y.Z"`),两处必须一致。
 
 ## 修改代码的约定
 
@@ -107,7 +114,8 @@ docker restart astrbot                                              # 4. 重启
 - 一切余额写入走 `_new_tx` → `_execute_tx` → `_complete_tx` 事务链;禁止直接调用 `client.balance_op` 绕过流水。
 - 结果未知的异常(`OutcomeUnknown`)只能查询证据,不能重发;这是账务安全的根基。
 - 面向用户的固定提示用 `UserError` 抛出,统一回复;不要把内部异常文本直接给用户。
-- 新增配置项要同步 `_conf_schema.json` 与 `main.py` 顶部 `DEFAULT_CONFIG`。
+- 新增配置项要同步 `_conf_schema.json`、`main.py` 顶部 `DEFAULT_CONFIG`(及 `__init__` 中的校验)与 README 配置表。
+- 新增运行时文件要同步 `.gitignore` 与 README 的运行时文件表。
 - 改动后跑 `python -m unittest discover -s tests -v`,全部用例通过再谈部署。
 
 ## 测试

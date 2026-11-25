@@ -1,8 +1,15 @@
 # 运行时状态与凭据,绝不入库
 state.json
+ledger_archive.json
 pending_recalls.json
 recovery_status.json
 status/
+
+# 原子写入的临时文件(进程异常退出时可能残留)
+.sub2api-state-*.tmp
+.sub2api-archive-*.tmp
+.quota-recall-*
+.recovery-status-*.tmp
 
 # Python
 __pycache__/

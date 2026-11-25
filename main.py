@@ -708,6 +708,12 @@ def _pct_color(pct):
     return _GREEN if pct >= 95 else (_AMBER if pct >= 70 else _RED)
 
 
+def _health_color(score):
+    if score is None:  # 数据缺失显示灰色"—"，不当作 0 分标红。
+        return _MUTED
+    return _GREEN if score >= 80 else (_AMBER if score >= 50 else _RED)
+
+
 async def build_group_rows(client: Sub2ApiClient) -> list:
     """收集公开启用分组的展示数据；专属(is_exclusive)与停用分组一律不收集。"""
     defs = await client.get_ops_list("/admin/groups/all")
@@ -783,6 +789,16 @@ def _chip(draw, x, y, text, font_obj, fill):
     return width + 26 + 8
 
 
+def _fit_text(draw, text, font_obj, max_width):
+    """超出宽度时截断并补省略号，避免过长的分组名压到右侧状态胶囊。"""
+    text = str(text)
+    if draw.textlength(text, font=font_obj) <= max_width:
+        return text
+    while text and draw.textlength(text + "…", font=font_obj) > max_width:
+        text = text[:-1]
+    return text + "…"
+
+
 def _pill(draw, right_x, y, text, fg, bg, font_obj):
     width = draw.textlength(text, font=font_obj)
     draw.rounded_rectangle((right_x - width - 30, y, right_x, y + 26), radius=13, fill=bg)
@@ -796,7 +812,7 @@ def render_group_cards(rows: list, generated: str) -> str:
     card_w = (width - 2 * margin - gap) // 2
     card_h = 262
     grid_rows = (len(rows) + 1) // 2
-    height = 64 + 84 + grid_rows * card_h + (grid_rows - 1) * gap + 56
+    height = 64 + 84 + grid_rows * card_h + max(grid_rows - 1, 0) * gap + 56
 
     f_chips = _card_font(13, bold=False)
     f_caps = _card_font(12, bold=False)
@@ -818,11 +834,12 @@ def render_group_cards(rows: list, generated: str) -> str:
     groups_ok = sum(1 for r in rows if not r["error"] and not r["limit"] and r["total"])
     groups_limit = sum(1 for r in rows if not r["error"] and r["limit"])
     groups_error = sum(1 for r in rows if r["error"])
+    # _chip 返回的是"胶囊宽度 + 间距"增量，下一个胶囊的横坐标需累加，否则会盖住前一个的末尾文字。
     x, y = margin, 66
-    x = _chip(draw, x, y, f"概览：{total_groups} 分组", f_chips, _TEXT)
-    x = _chip(draw, x, y, f"正常 {groups_ok} · 限流 {groups_limit} · 异常 {groups_error}", f_chips, _TEXT)
+    x += _chip(draw, x, y, f"概览：{total_groups} 分组", f_chips, _TEXT)
+    _chip(draw, x, y, f"正常 {groups_ok} · 限流 {groups_limit} · 异常 {groups_error}", f_chips, _TEXT)
     y += 40
-    x = _chip(draw, margin, y, "周期：近 1 小时", f_chips, _TEXT)
+    x = margin + _chip(draw, margin, y, "周期：近 1 小时", f_chips, _TEXT)
     _chip(draw, x, y, f"更新于 {generated}", f_chips, _MUTED)
 
     top = 150
@@ -836,15 +853,17 @@ def render_group_cards(rows: list, generated: str) -> str:
 
         _spaced_label(draw, (ix, iy), row["platform"], f_caps, _MUTED)
         name_y = iy + 20
-        draw.text((ix, name_y), row["name"], font=f_name, fill=_TEXT)
         if row["error"]:
-            _pill(draw, x0 + card_w - pad, name_y - 2, "异常", _RED, _RED_BG, f_badge)
+            pill = ("异常", _RED, _RED_BG)
         elif row["limit"]:
-            _pill(draw, x0 + card_w - pad, name_y - 2, "限流", _AMBER, _AMBER_BG, f_badge)
+            pill = ("限流", _AMBER, _AMBER_BG)
         elif row["total"] == 0:
-            _pill(draw, x0 + card_w - pad, name_y - 2, "无渠道", _MUTED, _GRAY_PILL, f_badge)
+            pill = ("无渠道", _MUTED, _GRAY_PILL)
         else:
-            _pill(draw, x0 + card_w - pad, name_y - 2, "正常", _GREEN, _GREEN_BG, f_badge)
+            pill = ("正常", _GREEN, _GREEN_BG)
+        name_room = card_w - 2 * pad - (draw.textlength(pill[0], font=f_badge) + 30) - 16
+        draw.text((ix, name_y), _fit_text(draw, row["name"], f_name, name_room), font=f_name, fill=_TEXT)
+        _pill(draw, x0 + card_w - pad, name_y - 2, *pill, f_badge)
 
         badge_y = name_y + 38
         multiplier = row["multiplier"]
@@ -864,8 +883,7 @@ def render_group_cards(rows: list, generated: str) -> str:
              "", _pct_color(avail_pct)),
             ("成功率", f"{row['rate']:.1f}%" if row["rate"] is not None else "—",
              "近 1 小时", _pct_color(row["rate"])),
-            ("健康分", str(health) if health is not None else "—",
-             "0 - 100", _GREEN if (health or 0) >= 80 else (_AMBER if (health or 0) >= 50 else _RED)),
+            ("健康分", str(health) if health is not None else "—", "0 - 100", _health_color(health)),
         )
         for j, (label, value, sub, color) in enumerate(tiles):
             tx = ix + j * (tile_w + 10)
@@ -900,7 +918,7 @@ def render_group_cards(rows: list, generated: str) -> str:
     return path
 
 
-@register("astrbot_plugin_sub2api", "zcode", "sub2api 余额互动：自动核账恢复与额度撤回", "1.6.3")
+@register("astrbot_plugin_sub2api", "zcode", "sub2api 余额互动：自动核账恢复与额度撤回", "1.6.4")
 class Sub2ApiPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -1275,7 +1293,7 @@ class Sub2ApiPlugin(Star):
 
     async def _audit(self, event, qq):
         # 受限人工裁决出口：只处理「结果未知且服务端查无记录」的单步签到流水。
-        # not_applied=确认未执行（docs/recovery.md 表第 1 行）；applied=确认已到账（补签到标记取 max 不回退）。
+        # not_applied=确认未执行（docs/recovery.md 第 5 节裁决表第 1 行）；applied=确认已到账（补签到标记取 max 不回退）。
         # 打劫流水含两步资金操作，单值裁决不足以表达分步证据，拒绝受理。
         if not event.is_admin():
             raise UserError("只有 AstrBot 管理员可以核账。")
@@ -1331,14 +1349,15 @@ class Sub2ApiPlugin(Star):
     async def _checkin(self, event, qq):
         binding = self._binding(qq)
         uid = binding["uid"]
+        today = datetime.now(TZ).strftime("%Y-%m-%d")
+        # 已签到是纯本地事实，先于账号读取判断：重复 /签到 不再请求管理 API，也不会在全局锁内等待上游。
+        if self.state["checkin"].get(qq) == today or self.state["checkin_uid"].get(str(uid)) == today:
+            raise UserError("今天已经签过了，明天再来吧~")
         # 与打劫相同，先读取并拦截负余额，避免签到加款请求触发上游拒绝后留下未知流水。
         before = await self._account(binding, for_write=True)
         if money(before["balance"]) < 0:
             raise UserError("你的余额为负，暂不能签到；本次未扣款，不计入签到记录。")
         self._require_clear(uid)
-        today = datetime.now(TZ).strftime("%Y-%m-%d")
-        if self.state["checkin"].get(qq) == today or self.state["checkin_uid"].get(str(uid)) == today:
-            raise UserError("今天已经签过了，明天再来吧~")
         amount = self._rand_amount()
         tx = self._new_tx("checkin", qq, amount, [{"uid": uid, "operation": "add"}], [before], date=today)
         user = (await self._execute_tx(tx))[0]
@@ -1448,12 +1467,15 @@ class Sub2ApiPlugin(Star):
                 # 只读指令：不占用全局账务锁，不要求绑定；仅收集公开启用分组。
                 rows = await build_group_rows(self.client)
                 image_path = render_group_cards(
-                    rows, datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"))
+                    rows, datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")) if rows else None
             except UserError as exc:
                 yield event.plain_result(str(exc))
                 return
             except Exception:
                 yield event.plain_result("监控卡片生成失败，请稍后重试或联系管理员。")
+                return
+            if image_path is None:
+                yield event.plain_result("当前没有可展示的公开分组。")
                 return
             yield event.image_result(image_path)
         finally:
