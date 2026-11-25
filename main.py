@@ -609,11 +609,12 @@ class Sub2ApiClient:
 
 
 async def collect_group_success_rates(client: Sub2ApiClient, name_filter: str = "") -> str:
-    """收集启用分组近一小时成功率。输出为白名单脱敏文本：
-    只有分组名与成功百分比，绝不包含账号数量、请求量、吞吐等规模数据。"""
+    """收集公开启用分组近一小时成功率。输出为白名单脱敏文本：
+    只有分组名与成功百分比，绝不包含账号数量、请求量、吞吐等规模数据。
+    与 /状态 卡片同一口径：专属(is_exclusive)与停用分组一律不收集，连快照都不请求。"""
     defs = await client.get_ops_list("/admin/groups/all")
-    enabled = [g for g in defs if isinstance(g, dict)
-               and g.get("status") == "active" and _positive_id(g.get("id"))]
+    enabled = [g for g in defs if isinstance(g, dict) and g.get("status") == "active"
+               and not g.get("is_exclusive") and _positive_id(g.get("id"))]
     keyword = (name_filter or "").strip().lower()
     if keyword:
         enabled = [g for g in enabled if keyword in str(g.get("name", "")).lower()]
@@ -645,9 +646,9 @@ async def collect_group_success_rates(client: Sub2ApiClient, name_filter: str = 
         else f"{name}:{rate:.1f}%" + ("(样本少)" if sparse else "")
         for name, rate, sparse in rows
     ]
-    header = "启用分组近一小时请求成功率（仅百分比，不含账号数量、请求量、吞吐等其他口径）："
+    header = "公开启用分组近一小时请求成功率（仅百分比，不含账号数量、请求量、吞吐等其他口径）："
     if not lines:
-        return header + "\n（没有匹配的启用分组）"
+        return header + "\n（没有匹配的公开启用分组）"
     return header + "\n" + "\n".join(lines)
 
 
@@ -1483,10 +1484,10 @@ class Sub2ApiPlugin(Star):
 
     @filter.llm_tool(name="query_group_success_rate")
     async def query_group_success_rate(self, event: AstrMessageEvent, group_name: str = ""):
-        """查询各渠道分组近一小时的请求成功率。当用户询问分组或渠道的服务质量、成功率、稳定性、哪个分组不稳定时调用。返回内容只有分组名称和成功百分比，不包含账号数量、请求量、吞吐量等规模数据。返回数值仅供口头总结，不要编造未提供的数据。
+        """查询各公开渠道分组近一小时的请求成功率。当用户询问分组或渠道的服务质量、成功率、稳定性、哪个分组不稳定时调用。返回内容只有分组名称和成功百分比，不包含账号数量、请求量、吞吐量等规模数据。返回数值仅供口头总结，不要编造未提供的数据。
 
         Args:
-            group_name(string): 可选。分组名称关键词，只返回名称包含该关键词的分组；留空或空字符串返回全部启用分组。
+            group_name(string): 可选。分组名称关键词，只返回名称包含该关键词的分组；留空或空字符串返回全部公开分组。
         """
         keyword = (group_name or "").strip().lower()
         cached = getattr(self, "_rate_cache", None)

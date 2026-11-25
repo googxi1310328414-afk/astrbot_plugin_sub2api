@@ -1348,7 +1348,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GroupStatusTests(unittest.IsolatedAsyncioTestCase):
-    """/状态 卡片与 LLM 工具的脱敏口径（AGENTS.md 红线 6）：只有分组级百分比，没有规模数据。"""
+    """/状态 卡片与 LLM 工具的脱敏口径（AGENTS.md 红线 6）：仅公开启用分组，只有分组级百分比，没有规模数据。"""
 
     GROUPS = [
         {"id": 1, "name": "Alpha", "status": "active", "platform": "openai", "rate_multiplier": 1.5},
@@ -1359,8 +1359,8 @@ class GroupStatusTests(unittest.IsolatedAsyncioTestCase):
         {"id": 6, "name": "Flaky", "status": "active", "platform": "openai"},
     ]
 
-    def ops(self, groups=None):
-        return FakeOpsClient(self.GROUPS if groups is None else groups, snapshots={
+    def ops(self):
+        return FakeOpsClient(self.GROUPS, snapshots={
             1: ops_snapshot(1234, 1220, points=((5, 0), (0, 0), (3, 1))),
             2: ops_snapshot(12, 9, health=40),
             3: ops_snapshot(0, 0),
@@ -1370,11 +1370,8 @@ class GroupStatusTests(unittest.IsolatedAsyncioTestCase):
             "2": {"total_accounts": 3, "available_count": 1, "rate_limit_count": 2, "error_count": 0},
         }, failing={6})
 
-    def public_groups(self):
-        return [group for group in self.GROUPS if not group.get("is_exclusive")]
-
     async def test_success_rate_text_is_whitelisted_percentages_only(self):
-        client = self.ops(self.public_groups())
+        client = self.ops()
         text = await plugin.collect_group_success_rates(client)
         header, *lines = text.splitlines()
         self.assertIn("仅百分比", header)
@@ -1382,20 +1379,26 @@ class GroupStatusTests(unittest.IsolatedAsyncioTestCase):
                                  "Gamma:近一小时无请求或数据暂缺", "Flaky:近一小时无请求或数据暂缺"])
         for line in lines:
             self.assertRegex(line, r"\A[^:]+:(\d{1,3}\.\d%(\(样本少\))?|近一小时无请求或数据暂缺)\Z")
-        for secret in ("1234", "1220", "987654", "12.5", "37", "SIMULATED", "Retired"):
+        for secret in ("1234", "1220", "987654", "12.5", "37", "SIMULATED", "Retired", "VIP", "5000", "4999"):
             self.assertNotIn(secret, text)
-        self.assertNotIn(4, client.snapshot_ids())
+        # 专属(5)与停用(4)分组连快照都不请求，与 /状态 卡片同一口径。
+        self.assertEqual(client.snapshot_ids(), [1, 2, 3, 6])
 
     async def test_success_rate_keyword_filter_matches_case_insensitively(self):
-        client = self.ops(self.public_groups())
+        client = self.ops()
         filtered = await plugin.collect_group_success_rates(client, "  ALP ")
         self.assertEqual(filtered.splitlines()[1:], ["Alpha:98.9%"])
         self.assertEqual(client.snapshot_ids(), [1])
-        self.assertTrue((await plugin.collect_group_success_rates(client, "不存在")).endswith("（没有匹配的启用分组）"))
+        for keyword in ("不存在", "vip"):  # 专属分组也不能靠关键词探测出来
+            with self.subTest(keyword=keyword):
+                result = await plugin.collect_group_success_rates(client, keyword)
+                self.assertTrue(result.endswith("（没有匹配的公开启用分组）"))
+                self.assertNotIn("VIP", result)
+        self.assertEqual(client.snapshot_ids(), [1])
 
     async def test_llm_tool_caches_per_keyword_for_sixty_seconds_and_never_caches_failures(self):
         bot = plugin.Sub2ApiPlugin.__new__(plugin.Sub2ApiPlugin)
-        bot.client = self.ops(self.public_groups())
+        bot.client = self.ops()
         now = [1000.0]
         with patch.object(plugin, "time", types.SimpleNamespace(time=lambda: now[0])):
             first = await bot.query_group_success_rate(Event(), "")
